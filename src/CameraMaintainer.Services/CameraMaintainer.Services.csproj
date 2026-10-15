@@ -1,0 +1,17 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <PackageReference Include="SkiaSharp" Version="4.153.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CameraMaintainer.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CameraMaintainer.Core\CameraMaintainer.Core.csproj" />
+    <ProjectReference Include="..\CameraMaintainer.Onvif\CameraMaintainer.Onvif.csproj" />
+    <ProjectReference Include="..\CameraMaintainer.Infrastructure\CameraMaintainer.Infrastructure.csproj" />
+  </ItemGroup>
+
+</Project>

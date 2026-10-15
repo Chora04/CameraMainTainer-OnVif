@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\CameraMaintainer.Core\CameraMaintainer.Core.csproj" />
+    <ProjectReference Include="..\CameraMaintainer.Services\CameraMaintainer.Services.csproj" />
+    <ProjectReference Include="..\CameraMaintainer.Workers\CameraMaintainer.Workers.csproj" />
+    <ProjectReference Include="..\CameraMaintainer.Infrastructure\CameraMaintainer.Infrastructure.csproj" />
+    <ProjectReference Include="..\CameraMaintainer.Onvif\CameraMaintainer.Onvif.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <!-- Keep local verification output outside the web static-asset graph. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);tmp\**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <Target Name="ExcludeSkiaSharpNativeSymbolsFromPublish" AfterTargets="ComputeFilesToPublish">
+    <ItemGroup>
+      <!-- SkiaSharp ships a 90+ MB native PDB as a runtime asset; it is not required to run the app. -->
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+                             Condition="'%(ResolvedFileToPublish.FileName)%(ResolvedFileToPublish.Extension)' == 'libSkiaSharp.pdb'" />
+    </ItemGroup>
+  </Target>
+
+</Project>

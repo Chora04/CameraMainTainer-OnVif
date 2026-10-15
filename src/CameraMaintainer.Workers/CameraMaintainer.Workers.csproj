@@ -1,0 +1,13 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\CameraMaintainer.Core\CameraMaintainer.Core.csproj" />
+    <ProjectReference Include="..\CameraMaintainer.Services\CameraMaintainer.Services.csproj" />
+    <ProjectReference Include="..\CameraMaintainer.Infrastructure\CameraMaintainer.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.13" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,605 @@
+@page "/Settings/{section?}"
+@attribute [Microsoft.AspNetCore.Authorization.Authorize]
+@using CameraMaintainer.Web.Security
+@using System.Security.Claims
+@{
+    ViewData["Title"] = "Настройки";
+    var username = User.FindFirstValue(ClaimTypes.Name) ?? "—";
+    var displayName = User.FindFirstValue(ClaimTypes.GivenName) ?? username;
+    var role = User.FindFirstValue(ClaimTypes.Role) ?? "Viewer";
+    var canViewAlerts = User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.ViewAlerts);
+    var canManageUsers = User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.ManageUsers);
+    var canManageMonitoring = User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.ViewCameras) &&
+        User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.ViewMaintenance) &&
+        User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.ManageCameras);
+    var selectedSection = ViewContext.RouteData.Values["section"]?.ToString();
+    var notificationsSelected = canViewAlerts &&
+        string.Equals(selectedSection, "Notifications", StringComparison.OrdinalIgnoreCase);
+    var retentionSelected = canManageUsers &&
+        string.Equals(selectedSection, "Storage", StringComparison.OrdinalIgnoreCase);
+    var accountSelected = string.IsNullOrWhiteSpace(selectedSection) ||
+        string.Equals(selectedSection, "Account", StringComparison.OrdinalIgnoreCase) ||
+        (!notificationsSelected && !retentionSelected && !string.Equals(selectedSection, "Monitoring", StringComparison.OrdinalIgnoreCase));
+    var roleLabel = role switch
+    {
+        "Admin" => "Администратор",
+        "Technician" => "Техник",
+        "Operator" => "Оператор",
+        _ => "Наблюдатель"
+    };
+}
+
+<header class="page-heading settings-heading">
+    <div>
+        <span class="eyebrow">Параметры системы</span>
+        <h1>Настройки</h1>
+        <p>Личные параметры аккаунта и доступные системные настройки.</p>
+    </div>
+</header>
+
+<div class="settings-sections-grid">
+<div class="settings-section-column">
+<details class="settings-accordion panel" open="@(accountSelected ? "open" : null)">
+    <summary class="settings-accordion-summary">
+        <span class="settings-accordion-icon"><i data-lucide="user-round"></i></span>
+        <span class="settings-accordion-copy"><strong>Аккаунт</strong><small>Данные профиля и смена пароля</small></span>
+        <i class="settings-accordion-chevron" data-lucide="chevron-down"></i>
+    </summary>
+
+    <div class="settings-accordion-content">
+        <div class="account-settings-layout">
+            <section class="account-profile-panel" aria-labelledby="profile-title">
+                <header class="panel-header">
+                    <div>
+                        <h2 id="profile-title">Текущий аккаунт</h2>
+                        <p>Данные назначаются администратором системы</p>
+                    </div>
+                    <span class="settings-panel-icon"><i data-lucide="user-round"></i></span>
+                </header>
+                <div class="account-profile-body">
+                    <span class="account-profile-avatar">@(displayName.Length > 0 ? displayName[..1].ToUpperInvariant() : "П")</span>
+                    <div class="account-profile-name"><strong>@displayName</strong><span>@@@username</span></div>
+                    <dl class="account-profile-facts">
+                        <div><dt>Роль</dt><dd>@roleLabel</dd></div>
+                        <div><dt>Состояние</dt><dd class="account-state-active"><i class="status-dot online"></i> Активен</dd></div>
+                    </dl>
+                </div>
+            </section>
+
+            <section class="account-security-panel" aria-labelledby="security-title">
+                <header class="panel-header">
+                    <div>
+                        <h2 id="security-title">Смена пароля</h2>
+                        <p>После сохранения остальные сеансы аккаунта будут завершены</p>
+                    </div>
+                    <span class="settings-panel-icon"><i data-lucide="shield-check"></i></span>
+                </header>
+                <form class="account-password-form" id="password-form" onsubmit="changeOwnPassword(event)">
+                    <div class="form-group">
+                        <label class="form-label" for="current-password">Текущий пароль</label>
+                        <input class="form-input" id="current-password" type="password" autocomplete="current-password" required>
+                    </div>
+                    <div class="password-fields">
+                        <div class="form-group">
+                            <label class="form-label" for="new-password">Новый пароль</label>
+                            <input class="form-input" id="new-password" type="password" autocomplete="new-password" minlength="8" required>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="confirm-password">Повторите новый пароль</label>
+                            <input class="form-input" id="confirm-password" type="password" autocomplete="new-password" minlength="8" required>
+                        </div>
+                    </div>
+                    <div class="account-password-actions">
+                        <span id="password-status" role="status">Минимум 8 символов</span>
+                        <button class="btn btn-primary" id="password-submit" type="submit"><i data-lucide="save"></i> Сохранить пароль</button>
+                    </div>
+                </form>
+            </section>
+        </div>
+    </div>
+</details>
+
+@if (canManageMonitoring)
+{
+<details class="settings-accordion panel" open="@(string.Equals(selectedSection, "Monitoring", StringComparison.OrdinalIgnoreCase) ? "open" : null)">
+    <summary class="settings-accordion-summary">
+        <span class="settings-accordion-icon"><i data-lucide="scan-line"></i></span>
+        <span class="settings-accordion-copy"><strong>Проверка камер</strong><small>Стабильность и периодичность</small></span>
+        <i class="settings-accordion-chevron" data-lucide="chevron-down"></i>
+    </summary>
+    <div class="settings-accordion-content">
+        <form id="monitoring-settings-form" onsubmit="saveMonitoringSettings(event)">
+            <fieldset id="monitoring-settings-fields" class="monitoring-settings-fields" disabled>
+                <div class="form-group">
+                    <label class="form-label" for="monitoring-healthy-checks">Проверок подряд без ошибок до признания стабильной</label>
+                    <input class="form-input" id="monitoring-healthy-checks" type="number" min="1" max="1000" value="5" required>
+                </div>
+                <label class="settings-toggle"><input id="monitoring-check-stable" type="checkbox" checked onchange="syncStableCheckControls()"><span class="toggle-track"></span><span>Проверять стабильные камеры</span></label>
+                <div class="form-group">
+                    <label class="form-label" for="monitoring-stable-cycles">Проверять стабильные камеры каждый N-й проход очереди</label>
+                    <input class="form-input" id="monitoring-stable-cycles" type="number" min="1" max="24" value="2" required>
+                </div>
+                <div class="monitoring-frame-heading">
+                    <strong>История анализа кадров</strong>
+                    <small>В норме сохраняются только показатели. Изображение записывается на диск при отклонении.</small>
+                </div>
+                <label class="settings-toggle"><input id="monitoring-store-frame-history" type="checkbox" checked onchange="syncFrameHistoryControls()"><span class="toggle-track"></span><span>Хранить историю анализа</span></label>
+                <label class="settings-toggle"><input id="monitoring-store-anomaly-images" type="checkbox" checked><span class="toggle-track"></span><span>Сохранять изображения с отклонениями</span></label>
+                <div class="monitoring-frame-grid">
+                    <div class="form-group">
+                        <label class="form-label" for="monitoring-frame-limit">Последних записей на камеру</label>
+                        <input class="form-input" id="monitoring-frame-limit" type="number" min="1" max="100" value="15" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="monitoring-brightness-min">Яркость, нижняя граница из 255</label>
+                        <input class="form-input" id="monitoring-brightness-min" type="number" min="0" max="254" step="0.1" value="35" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="monitoring-brightness-max">Яркость, верхняя граница из 255</label>
+                        <input class="form-input" id="monitoring-brightness-max" type="number" min="1" max="255" step="0.1" value="220" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="monitoring-contrast-min">Минимальный контраст</label>
+                        <input class="form-input" id="monitoring-contrast-min" type="number" min="0" max="128" step="0.1" value="24" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="monitoring-entropy-min">Минимальная энтропия из 8 бит</label>
+                        <input class="form-input" id="monitoring-entropy-min" type="number" min="0" max="8" step="0.1" value="5" required>
+                    </div>
+                </div>
+                <div class="notification-settings-actions">
+                    <button class="btn btn-primary" id="monitoring-settings-submit" type="submit"><i data-lucide="save"></i> Сохранить</button>
+                </div>
+            </fieldset>
+            <span id="monitoring-settings-status" role="status"></span>
+        </form>
+    </div>
+</details>
+}
+
+</div>
+<div class="settings-section-column">
+
+@if (canViewAlerts)
+{
+<details class="settings-accordion panel" open="@(notificationsSelected ? "open" : null)">
+    <summary class="settings-accordion-summary">
+        <span class="settings-accordion-icon"><i data-lucide="bell-ring"></i></span>
+        <span class="settings-accordion-copy"><strong>Уведомления</strong><small>Типы событий и сроки напоминаний по карточкам</small></span>
+        <i class="settings-accordion-chevron" data-lucide="chevron-down"></i>
+    </summary>
+
+    <div class="settings-accordion-content">
+        <form id="notification-settings-form" class="notification-settings-layout" onsubmit="saveNotificationPreferences(event)">
+            <section class="account-security-panel notification-settings-panel" aria-labelledby="notification-types-title">
+                <header class="panel-header">
+                    <div>
+                        <h2 id="notification-types-title">Типы уведомлений</h2>
+                        <p>Выберите события, которые должны появляться у этого аккаунта</p>
+                    </div>
+                    <span class="settings-panel-icon"><i data-lucide="list-checks"></i></span>
+                </header>
+                <div class="notification-options">
+                    <label class="settings-toggle notification-option">
+                        <input id="notify-sound" type="checkbox" checked>
+                        <span class="toggle-track"></span>
+                        <span><strong>Звуковой сигнал</strong></span>
+                    </label>
+                    <label class="settings-toggle notification-option">
+                        <input id="notify-popup" type="checkbox" checked>
+                        <span class="toggle-track"></span>
+                        <span><strong>Всплывающее уведомление</strong></span>
+                    </label>
+                    <button class="btn btn-secondary btn-sm" type="button" onclick="testNotificationSound()"><i data-lucide="volume-2"></i> Проверить звук</button>
+                    <label class="settings-toggle notification-option">
+                        <input id="notify-assignments" type="checkbox" checked>
+                        <span class="toggle-track"></span>
+                        <span><strong>Новые карточки и назначения</strong><small>Администратору — новые ошибки, технику — назначенные ему</small></span>
+                    </label>
+                    <label class="settings-toggle notification-option">
+                        <input id="notify-review" type="checkbox" checked>
+                        <span class="toggle-track"></span>
+                        <span><strong>Работа передана на проверку</strong><small>Уведомление менеджеру после завершения работы техником</small></span>
+                    </label>
+                    <label class="settings-toggle notification-option">
+                        <input id="notify-handoffs" type="checkbox" checked>
+                        <span class="toggle-track"></span>
+                        <span><strong>Передача работы между сотрудниками</strong><small>Новая передача, принятие, возврат, завершение и просрочка</small></span>
+                    </label>
+                    <label class="settings-toggle notification-option">
+                        <input id="notify-overdue" type="checkbox" checked>
+                        <span class="toggle-track"></span>
+                        <span><strong>Карточка долго без изменений</strong><small>Напоминание ответственному и администратору</small></span>
+                    </label>
+                    <label class="settings-toggle notification-option">
+                        <input id="notify-calendar-notes" type="checkbox" checked>
+                        <span class="toggle-track"></span>
+                        <span><strong>Общие заметки календаря</strong><small>Напоминание за сутки до события и при просрочке</small></span>
+                    </label>
+                </div>
+            </section>
+
+            <section class="account-security-panel notification-settings-panel" aria-labelledby="notification-time-title">
+                <header class="panel-header">
+                    <div>
+                        <h2 id="notification-time-title">Сроки уведомлений</h2>
+                        <p>Интервалы применяются отдельно для текущего аккаунта</p>
+                    </div>
+                    <span class="settings-panel-icon"><i data-lucide="timer"></i></span>
+                </header>
+                <div class="notification-time-fields">
+                    <div class="form-group">
+                        <label class="form-label" for="notify-recent-minutes">Показывать новое событие, минут</label>
+                        <input class="form-input" id="notify-recent-minutes" type="number" min="5" max="1440" value="60" required>
+                        <small>От 5 минут до 24 часов</small>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="notify-overdue-hours">Считать карточку просроченной через, часов</label>
+                        <input class="form-input" id="notify-overdue-hours" type="number" min="1" max="168" value="4" required>
+                        <small>От 1 часа до 7 дней без изменений</small>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="notify-handoff-hours">Срок принятия передачи, часов</label>
+                        <input class="form-input" id="notify-handoff-hours" type="number" min="1" max="720" value="24" required>
+                        <small>После этого срока передача будет отмечена как требующая внимания</small>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="notify-handoff-repeat-hours">Повторять напоминание каждые, часов</label>
+                        <input class="form-input" id="notify-handoff-repeat-hours" type="number" min="1" max="168" value="4" required>
+                        <small>Настройка сохраняется отдельно для текущего аккаунта</small>
+                    </div>
+                    <div class="notification-settings-actions">
+                        <span id="notification-settings-status" role="status"></span>
+                        <button class="btn btn-primary" id="notification-settings-submit" type="submit"><i data-lucide="save"></i> Сохранить уведомления</button>
+                    </div>
+                </div>
+            </section>
+        </form>
+    </div>
+</details>
+}
+
+@if (canManageUsers)
+{
+<details class="settings-accordion panel" open="@(retentionSelected ? "open" : null)">
+    <summary class="settings-accordion-summary">
+        <span class="settings-accordion-icon"><i data-lucide="database"></i></span>
+        <span class="settings-accordion-copy"><strong>Хранение данных</strong><small>Срок хранения истории закрытых ошибок</small></span>
+        <i class="settings-accordion-chevron" data-lucide="chevron-down"></i>
+    </summary>
+
+    <div class="settings-accordion-content">
+        <form id="retention-settings-form" class="retention-settings-layout" onsubmit="saveRetentionSettings(event)">
+            <section class="account-security-panel retention-policy-panel" aria-labelledby="retention-policy-title">
+                <header class="panel-header">
+                    <div>
+                        <h2 id="retention-policy-title">Политика хранения ошибок</h2>
+                        <p>Закрытые записи удаляются постепенно по мере окончания их срока</p>
+                    </div>
+                    <span class="settings-panel-icon"><i data-lucide="calendar-clock"></i></span>
+                </header>
+                <div class="retention-policy-fields">
+                    <div class="form-group">
+                        <label class="form-label" for="retention-months">Хранить историю</label>
+                        <select class="form-input" id="retention-months">
+                            <option value="1">1 месяц</option>
+                            <option value="3" selected>3 месяца</option>
+                            <option value="6">6 месяцев</option>
+                            <option value="12">1 год</option>
+                            <option value="24">2 года</option>
+                            <option value="0">Без ограничения</option>
+                        </select>
+                    </div>
+                    <div class="retention-rules" aria-label="Правила очистки">
+                        <span><i data-lucide="check"></i> Активные ошибки не удаляются</span>
+                        <span><i data-lucide="refresh-cw"></i> Освобождённое место используется новыми записями</span>
+                        <span><i data-lucide="calendar-range"></i> Срок рассчитывается календарными месяцами</span>
+                    </div>
+                    <div class="retention-settings-actions">
+                        <span id="retention-settings-status" role="status"></span>
+                        <button class="btn btn-primary" id="retention-settings-submit" type="submit"><i data-lucide="save"></i> Сохранить</button>
+                    </div>
+                </div>
+            </section>
+
+            <section class="account-security-panel retention-status-panel" aria-labelledby="retention-status-title">
+                <header class="panel-header">
+                    <div>
+                        <h2 id="retention-status-title">Состояние хранилища</h2>
+                        <p>Фактические данные по истории закрытых ошибок</p>
+                    </div>
+                    <span class="settings-panel-icon"><i data-lucide="hard-drive"></i></span>
+                </header>
+                <dl class="retention-stats">
+                    <div><dt>Закрытых ошибок</dt><dd id="retention-resolved-count">—</dd></div>
+                    <div><dt>Старейшая запись</dt><dd id="retention-oldest-date">—</dd></div>
+                    <div><dt>Граница хранения</dt><dd id="retention-cutoff-date">—</dd></div>
+                    <div><dt>Последняя очистка</dt><dd id="retention-last-run">—</dd></div>
+                    <div><dt>Удалено за запуск</dt><dd id="retention-last-deleted">0</dd></div>
+                </dl>
+                <div class="retention-cleanup-actions">
+                    <span id="retention-eligible-count">К удалению сейчас: 0</span>
+                    <button class="btn btn-secondary" id="retention-cleanup-button" type="button" onclick="runRetentionCleanup()"><i data-lucide="trash-2"></i> Очистить сейчас</button>
+                </div>
+            </section>
+        </form>
+    </div>
+</details>
+}
+</div>
+</div>
+
+@section Scripts {
+<script>
+    function syncStableCheckControls() {
+        document.getElementById('monitoring-stable-cycles').disabled = !document.getElementById('monitoring-check-stable').checked;
+    }
+
+    function syncFrameHistoryControls() {
+        const enabled = document.getElementById('monitoring-store-frame-history').checked;
+        [
+            'monitoring-store-anomaly-images',
+            'monitoring-frame-limit',
+            'monitoring-brightness-min',
+            'monitoring-brightness-max',
+            'monitoring-contrast-min',
+            'monitoring-entropy-min'
+        ].forEach(id => { document.getElementById(id).disabled = !enabled; });
+    }
+
+    async function loadMonitoringSettings() {
+        const fields = document.getElementById('monitoring-settings-fields');
+        if (!fields) return;
+        const snapshot = captureLiveForm('monitoring-settings-form');
+        try {
+            const policy = await apiFetch('/api/settings/camera-monitoring');
+            if (!canApplyLiveForm(snapshot)) return;
+            document.getElementById('monitoring-healthy-checks').value = policy.healthyChecksRequired;
+            document.getElementById('monitoring-check-stable').checked = policy.checkStableCameras;
+            document.getElementById('monitoring-stable-cycles').value = policy.stableCheckEveryCycles;
+            document.getElementById('monitoring-store-frame-history').checked = policy.storeFrameHistory;
+            document.getElementById('monitoring-store-anomaly-images').checked = policy.storeAnomalyImages;
+            document.getElementById('monitoring-frame-limit').value = policy.frameHistoryLimitPerCamera;
+            document.getElementById('monitoring-brightness-min').value = policy.normalBrightnessMinimum;
+            document.getElementById('monitoring-brightness-max').value = policy.normalBrightnessMaximum;
+            document.getElementById('monitoring-contrast-min').value = policy.normalContrastMinimum;
+            document.getElementById('monitoring-entropy-min').value = policy.normalEntropyMinimum;
+            fields.disabled = false;
+            syncStableCheckControls();
+            syncFrameHistoryControls();
+        } catch (error) {
+            document.getElementById('monitoring-settings-status').textContent = error.message;
+        }
+    }
+
+    async function saveMonitoringSettings(event) {
+        event.preventDefault();
+        const snapshot = captureLiveForm('monitoring-settings-form');
+        const status = document.getElementById('monitoring-settings-status');
+        const button = document.getElementById('monitoring-settings-submit');
+        button.disabled = true;
+        try {
+            await apiFetch('/api/settings/camera-monitoring', { method: 'PUT', body: {
+                healthyChecksRequired: Number(document.getElementById('monitoring-healthy-checks').value),
+                checkStableCameras: document.getElementById('monitoring-check-stable').checked,
+                stableCheckEveryCycles: Number(document.getElementById('monitoring-stable-cycles').value),
+                storeFrameHistory: document.getElementById('monitoring-store-frame-history').checked,
+                storeAnomalyImages: document.getElementById('monitoring-store-anomaly-images').checked,
+                frameHistoryLimitPerCamera: Number(document.getElementById('monitoring-frame-limit').value),
+                normalBrightnessMinimum: Number(document.getElementById('monitoring-brightness-min').value),
+                normalBrightnessMaximum: Number(document.getElementById('monitoring-brightness-max').value),
+                normalContrastMinimum: Number(document.getElementById('monitoring-contrast-min').value),
+                normalEntropyMinimum: Number(document.getElementById('monitoring-entropy-min').value)
+            }});
+            markLiveFormSaved(snapshot);
+            status.textContent = 'Сохранено';
+        } catch (error) { status.textContent = error.message; }
+        finally { button.disabled = false; }
+    }
+
+    async function changeOwnPassword(event) {
+        event.preventDefault();
+        const form = event.currentTarget;
+        const currentPassword = document.getElementById('current-password').value;
+        const newPassword = document.getElementById('new-password').value;
+        const confirmPassword = document.getElementById('confirm-password').value;
+        const status = document.getElementById('password-status');
+        const submit = document.getElementById('password-submit');
+
+        status.className = '';
+        if (newPassword.length < 8) {
+            status.textContent = 'Новый пароль должен содержать минимум 8 символов';
+            status.className = 'error';
+            return;
+        }
+        if (newPassword !== confirmPassword) {
+            status.textContent = 'Новые пароли не совпадают';
+            status.className = 'error';
+            return;
+        }
+
+        submit.disabled = true;
+        status.textContent = 'Сохраняем новый пароль...';
+        try {
+            await apiFetch('/api/accounts/me/password', {
+                method: 'PUT',
+                body: { currentPassword, newPassword }
+            });
+            form.reset();
+            status.textContent = 'Пароль успешно изменён';
+            status.className = 'success';
+            showToast('Пароль аккаунта изменён', 'success');
+        } catch (error) {
+            status.textContent = error.message;
+            status.className = 'error';
+            showToast(error.message, 'error');
+        } finally {
+            submit.disabled = false;
+        }
+    }
+
+    async function loadNotificationPreferences() {
+        const form = document.getElementById('notification-settings-form');
+        if (!form) return;
+        const snapshot = captureLiveForm('notification-settings-form');
+        try {
+            const settings = await apiFetch('/api/notifications/preferences');
+            if (!canApplyLiveForm(snapshot)) return;
+            document.getElementById('notify-sound').checked = settings.soundEnabled !== false;
+            document.getElementById('notify-popup').checked = settings.popupEnabled !== false;
+            document.getElementById('notify-assignments').checked = settings.assignmentsEnabled !== false;
+            document.getElementById('notify-review').checked = settings.reviewRequestsEnabled !== false;
+            document.getElementById('notify-overdue').checked = settings.overdueEnabled !== false;
+            document.getElementById('notify-handoffs').checked = settings.handoffsEnabled !== false;
+            document.getElementById('notify-calendar-notes').checked = settings.calendarNotesEnabled !== false;
+            document.getElementById('notify-recent-minutes').value = settings.recentWindowMinutes || 60;
+            document.getElementById('notify-overdue-hours').value = settings.overdueHours || 4;
+            document.getElementById('notify-handoff-hours').value = settings.handoffDueHours || 24;
+            document.getElementById('notify-handoff-repeat-hours').value = settings.handoffRepeatHours || 4;
+        } catch (error) {
+            const status = document.getElementById('notification-settings-status');
+            status.textContent = error.message;
+            status.className = 'error';
+        }
+    }
+
+    async function saveNotificationPreferences(event) {
+        event.preventDefault();
+        const snapshot = captureLiveForm('notification-settings-form');
+        const submit = document.getElementById('notification-settings-submit');
+        const status = document.getElementById('notification-settings-status');
+        submit.disabled = true;
+        status.className = '';
+        status.textContent = 'Сохраняем...';
+        try {
+            await apiFetch('/api/notifications/preferences', {
+                method: 'PUT',
+                body: {
+                    assignmentsEnabled: document.getElementById('notify-assignments').checked,
+                    soundEnabled: document.getElementById('notify-sound').checked,
+                    popupEnabled: document.getElementById('notify-popup').checked,
+                    reviewRequestsEnabled: document.getElementById('notify-review').checked,
+                    overdueEnabled: document.getElementById('notify-overdue').checked,
+                    handoffsEnabled: document.getElementById('notify-handoffs').checked,
+                    calendarNotesEnabled: document.getElementById('notify-calendar-notes').checked,
+                    recentWindowMinutes: Number(document.getElementById('notify-recent-minutes').value),
+                    overdueHours: Number(document.getElementById('notify-overdue-hours').value),
+                    handoffDueHours: Number(document.getElementById('notify-handoff-hours').value),
+                    handoffRepeatHours: Number(document.getElementById('notify-handoff-repeat-hours').value)
+                }
+            });
+            status.textContent = 'Настройки сохранены';
+            markLiveFormSaved(snapshot);
+            status.className = 'success';
+            showToast('Настройки уведомлений сохранены', 'success');
+            if (typeof window.loadAccountNotifications === 'function')
+                window.loadAccountNotifications();
+        } catch (error) {
+            status.textContent = error.message;
+            status.className = 'error';
+            showToast(error.message, 'error');
+        } finally {
+            submit.disabled = false;
+        }
+    }
+
+    const retentionDateFormatter = new Intl.DateTimeFormat(window.uiLocale?.intlLocale || 'ru-RU', {
+        timeZone: 'Asia/Tashkent',
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+    });
+
+    function formatRetentionDate(value) {
+        return value ? retentionDateFormatter.format(new Date(value)) : '—';
+    }
+
+    function renderRetentionOverview(overview) {
+        const months = String(overview.policy?.retentionMonths ?? 3);
+        if (canApplyLiveForm(captureLiveForm('retention-settings-form')))
+            document.getElementById('retention-months').value = months;
+        document.getElementById('retention-resolved-count').textContent = overview.resolvedAlertCount ?? 0;
+        document.getElementById('retention-oldest-date').textContent = formatRetentionDate(overview.oldestResolvedAtUtc);
+        document.getElementById('retention-cutoff-date').textContent = overview.cutoffUtc
+            ? `До ${formatRetentionDate(overview.cutoffUtc)}`
+            : 'Не ограничена';
+        document.getElementById('retention-last-run').textContent = formatRetentionDate(overview.lastRun?.runAtUtc);
+        document.getElementById('retention-last-deleted').textContent = overview.lastRun
+            ? `${overview.lastRun.deletedAlerts} ошибок, ${overview.lastRun.deletedAuditEvents} действий`
+            : '0';
+        document.getElementById('retention-eligible-count').textContent = `К удалению сейчас: ${overview.eligibleAlertCount ?? 0}`;
+    }
+
+    async function loadRetentionSettings() {
+        const form = document.getElementById('retention-settings-form');
+        if (!form) return;
+        const status = document.getElementById('retention-settings-status');
+        try {
+            renderRetentionOverview(await apiFetch('/api/settings/error-retention'));
+        } catch (error) {
+            status.textContent = error.message;
+            status.className = 'error';
+        }
+    }
+
+    async function saveRetentionSettings(event) {
+        event.preventDefault();
+        const snapshot = captureLiveForm('retention-settings-form');
+        const submit = document.getElementById('retention-settings-submit');
+        const status = document.getElementById('retention-settings-status');
+        submit.disabled = true;
+        status.className = '';
+        status.textContent = 'Сохраняем и проверяем историю...';
+        try {
+            const overview = await apiFetch('/api/settings/error-retention', {
+                method: 'PUT',
+                body: { retentionMonths: Number(document.getElementById('retention-months').value) }
+            });
+            markLiveFormSaved(snapshot);
+            renderRetentionOverview(overview);
+            status.textContent = 'Срок хранения сохранён';
+            status.className = 'success';
+            showToast('Политика хранения ошибок обновлена', 'success');
+        } catch (error) {
+            status.textContent = error.message;
+            status.className = 'error';
+            showToast(error.message, 'error');
+        } finally {
+            submit.disabled = false;
+        }
+    }
+
+    async function runRetentionCleanup() {
+        const button = document.getElementById('retention-cleanup-button');
+        const status = document.getElementById('retention-settings-status');
+        button.disabled = true;
+        status.className = '';
+        status.textContent = 'Проверяем срок записей...';
+        try {
+            const overview = await apiFetch('/api/settings/error-retention/cleanup', { method: 'POST' });
+            renderRetentionOverview(overview);
+            status.textContent = 'Очистка завершена';
+            status.className = 'success';
+            showToast('История ошибок очищена по установленному сроку', 'success');
+        } catch (error) {
+            status.textContent = error.message;
+            status.className = 'error';
+            showToast(error.message, 'error');
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', loadNotificationPreferences);
+    document.addEventListener('DOMContentLoaded', loadRetentionSettings);
+    document.addEventListener('DOMContentLoaded', loadMonitoringSettings);
+    document.addEventListener('camera-maintainer:data-refresh', event => {
+        if (!event.detail.topics.includes('settings')) return;
+        event.detail.waitUntil(Promise.all([
+            loadMonitoringSettings(), loadNotificationPreferences(), loadRetentionSettings()
+        ]));
+    });
+</script>
+}

@@ -1,0 +1,2046 @@
+@page "/Alerts"
+@attribute [Microsoft.AspNetCore.Authorization.Authorize(Policy = CameraMaintainer.Web.Security.AccessPolicies.ViewAlerts)]
+@using CameraMaintainer.Core.Enums
+@using CameraMaintainer.Core.Models
+@using CameraMaintainer.Infrastructure.Data
+@using CameraMaintainer.Infrastructure.Data.Repositories
+@using CameraMaintainer.Web.Security
+@using CameraMaintainer.Web.Models
+@using Microsoft.EntityFrameworkCore
+@using System.Security.Claims
+@using System.Text.Json
+@inject AppDbContext Db
+@inject AlertBoardRepository AlertBoardRepo
+
+@{
+    ViewData["Title"] = "Ошибки";
+
+    var canViewHistory = User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.ViewAlertHistory);
+    var view = canViewHistory && Request.Query["view"].ToString().Equals("history", StringComparison.OrdinalIgnoreCase)
+        ? "history"
+        : "active";
+    var category = Request.Query["category"].ToString().ToLowerInvariant() switch
+    {
+        "physical" => "physical",
+        "technical" => "technical",
+        _ => "all"
+    };
+    var state = Request.Query["state"].ToString().ToLowerInvariant() switch
+    {
+        "unassigned" => "unassigned",
+        "assigned" => "assigned",
+        _ => "all"
+    };
+    var currentPage = int.TryParse(Request.Query["page"], out var requestedPage) && requestedPage > 0
+        ? requestedPage
+        : 1;
+    const int perPage = 40;
+    var folderKey = Request.Query["camera"].ToString();
+    var inHistoryFolder = view == "history" && (folderKey == "system" || (int.TryParse(folderKey, out var folderId) && folderId > 0));
+    int? historyCameraId = int.TryParse(folderKey, out var selectedCameraId) && selectedCameraId > 0 ? selectedCameraId : null;
+    var foldersPage = int.TryParse(Request.Query["foldersPage"], out var parentPage) && parentPage > 0 ? parentPage : 1;
+
+    var canWork = User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.RunChecks);
+    var canManageUsers = User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.ManageUsers) && User.IsInRole("Admin");
+    var currentUserId = int.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier), out var parsedUserId)
+        ? parsedUserId
+        : 0;
+    var currentRole = User.FindFirstValue(ClaimTypes.Role);
+    var actor = await Db.AppUsers.AsNoTracking().SingleAsync(user => user.Id == currentUserId);
+    var currentAccountColumnKeys = actor.AlertBoardColumnKeys;
+
+    var managers = await Db.AppUsers
+        .AsNoTracking()
+        .Where(user => user.IsActive && user.CanViewAlerts && user.CanRunChecks)
+        .OrderBy(user => user.DisplayName)
+        .ThenBy(user => user.Username)
+        .ToListAsync();
+
+    var allBoardColumns = await AlertBoardRepo.GetColumnsAsync();
+    var alertQuery = AlertVisibilityPolicy.ApplyToQuery(Db.Alerts.AsNoTracking(), actor, allBoardColumns);
+    var counts = await alertQuery.GroupBy(alert => new
+        {
+            alert.AutoResolved,
+            HasPhysical = alert.Issues.Any(issue => issue.Category == ErrorCategory.Physical) || (!alert.Issues.Any() && alert.Category == ErrorCategory.Physical),
+            HasTechnical = alert.Issues.Any(issue => issue.Category == ErrorCategory.Technical) || (!alert.Issues.Any() && alert.Category == ErrorCategory.Technical),
+            Assigned = alert.AssignedToUserId.HasValue,
+            Stage = alert.WorkflowStage == null || alert.WorkflowStage == ""
+                ? (alert.AssignedToUserId.HasValue ? "assigned" : "new") : alert.WorkflowStage
+        })
+        .Select(group => new { group.Key.AutoResolved, group.Key.HasPhysical, group.Key.HasTechnical, group.Key.Assigned, group.Key.Stage, Count = group.Count() })
+        .ToListAsync();
+    var boardColumns = allBoardColumns
+        .Where(column => AlertBoardRoleVisibility.IsVisibleTo(
+            column,
+            currentRole,
+            canManageUsers,
+            currentAccountColumnKeys))
+        .ToList();
+    var activeAlerts = counts.Where(alert => !alert.AutoResolved).ToList();
+    var historyAlerts = counts.Where(alert => alert.AutoResolved).ToList();
+    var viewAlerts = view == "history" ? historyAlerts : activeAlerts;
+    var sourceAlerts = viewAlerts;
+
+    if (category == "physical")
+        sourceAlerts = sourceAlerts.Where(alert => alert.HasPhysical).ToList();
+    else if (category == "technical")
+        sourceAlerts = sourceAlerts.Where(alert => alert.HasTechnical).ToList();
+
+    var selectedCategoryLabel = category switch
+    {
+        "physical" => "Физические",
+        "technical" => "Технические",
+        _ => "Все типы"
+    };
+    var selectedCategoryCount = sourceAlerts.Sum(alert => alert.Count);
+    var categoryAlerts = sourceAlerts;
+    var selectedStateLabel = state switch
+    {
+        "unassigned" => "Новые",
+        "assigned" => "В работе",
+        _ => "Вся очередь"
+    };
+
+    if (view == "active" && state == "unassigned")
+        sourceAlerts = sourceAlerts.Where(alert => !alert.Assigned).ToList();
+    else if (view == "active" && state == "assigned")
+        sourceAlerts = sourceAlerts.Where(alert => alert.Assigned).ToList();
+
+    var selectedStateCount = sourceAlerts.Sum(alert => alert.Count);
+    var totalCount = selectedStateCount;
+    var totalPages = Math.Max(1, (int)Math.Ceiling(totalCount / (double)perPage));
+    currentPage = Math.Min(currentPage, totalPages);
+    var selectedQuery = alertQuery.Where(alert => alert.AutoResolved == (view == "history"));
+    if (category == "physical") selectedQuery = selectedQuery.Where(alert => alert.Issues.Any(issue => issue.Category == ErrorCategory.Physical) || (!alert.Issues.Any() && alert.Category == ErrorCategory.Physical));
+    if (category == "technical") selectedQuery = selectedQuery.Where(alert => alert.Issues.Any(issue => issue.Category == ErrorCategory.Technical) || (!alert.Issues.Any() && alert.Category == ErrorCategory.Technical));
+    if (view == "active" && state == "assigned") selectedQuery = selectedQuery.Where(alert => alert.AssignedToUserId.HasValue);
+    if (view == "active" && state == "unassigned") selectedQuery = selectedQuery.Where(alert => !alert.AssignedToUserId.HasValue);
+    var historyFolders = new List<CameraHistoryFolder>();
+    CameraHistoryFolder? selectedHistoryFolder = null;
+    if (view == "history")
+    {
+        var folders = CameraHistoryFolder.From(selectedQuery);
+        if (inHistoryFolder)
+        {
+            selectedHistoryFolder = await folders.SingleOrDefaultAsync(folder => folder.CameraId == historyCameraId);
+            selectedQuery = selectedQuery.Where(alert => alert.CameraId == historyCameraId);
+            totalCount = selectedHistoryFolder?.Cases ?? 0;
+            selectedCategoryCount = totalCount;
+            totalPages = Math.Max(1, (int)Math.Ceiling(totalCount / (double)perPage));
+        }
+        else
+        {
+            var folderCount = await folders.CountAsync();
+            totalPages = Math.Max(1, (int)Math.Ceiling(folderCount / (double)perPage));
+        }
+        currentPage = Math.Min(requestedPage > 0 ? requestedPage : 1, totalPages);
+        if (!inHistoryFolder)
+            historyFolders = await folders.OrderBy(folder => folder.CameraId == null).ThenBy(folder => folder.CameraId)
+                .Skip((currentPage - 1) * perPage).Take(perPage).ToListAsync();
+    }
+    var pagedAlerts = view == "history" && !inHistoryFolder ? new List<Alert>() : await selectedQuery.Include(alert => alert.Camera).Include(alert => alert.Handoffs).Include(alert => alert.Issues).AsSplitQuery()
+        .OrderByDescending(alert => alert.CreatedAt).ThenByDescending(alert => alert.Id)
+        .Skip((currentPage - 1) * perPage)
+        .Take(perPage)
+        .ToListAsync();
+    var crmStages = boardColumns.Select(column => new
+    {
+        column.Key,
+        column.Title,
+        column.Subtitle,
+        column.Color,
+        column.VisibleToRoles,
+        Items = pagedAlerts.Where(alert => EffectiveWorkflowStage(alert).Equals(column.Key, StringComparison.OrdinalIgnoreCase)).ToList(),
+        Total = sourceAlerts.Where(alert => alert.Stage.Equals(column.Key, StringComparison.OrdinalIgnoreCase)).Sum(alert => alert.Count)
+    }).ToList();
+
+    var managerPayload = managers.Select(user => new
+    {
+        id = user.Id,
+        username = user.Username,
+        displayName = user.DisplayName,
+        role = user.Role
+    });
+    var boardColumnPayload = (canManageUsers ? allBoardColumns : boardColumns).Select(column => new
+    {
+        key = column.Key,
+        title = column.Title,
+        subtitle = column.Subtitle,
+        color = column.Color,
+        visibleToRoles = canManageUsers ? column.VisibleToRoles : []
+    }).ToList();
+}
+
+<header class="page-heading queue-page-heading">
+    <div>
+        <h1>@(view == "history" ? "История ошибок" : "Очередь ошибок")</h1>
+    </div>
+    <div class="page-actions">
+        <span class="queue-health"><i class="status-dot online"></i><span><strong>Контроль активен</strong><small>@activeAlerts.Sum(alert => alert.Count) требуют внимания</small></span></span>
+        @if (canManageUsers)
+        {
+            <button class="btn btn-secondary" type="button" onclick="openAlertBoardSettings()"><i data-lucide="settings-2"></i> Настроить этапы</button>
+        }
+    </div>
+</header>
+
+<div class="queue-workspace">
+<aside class="queue-overview" aria-label="Обработка заявок">
+<h2>Обработка заявок</h2>
+<section class="queue-summary @(!canViewHistory ? "history-disabled" : "")" aria-label="Сводка обработки ошибок">
+    <a class="queue-stat @(view == "active" && state == "all" ? "active" : "")" href="/Alerts?view=active">
+        <span>Активные</span><strong>@activeAlerts.Sum(alert => alert.Count)</strong><small>в очереди</small>
+    </a>
+    <a class="queue-stat warning @(state == "unassigned" ? "active" : "")" href="/Alerts?view=active&state=unassigned">
+        <span>Не назначены</span><strong>@activeAlerts.Where(alert => !alert.Assigned).Sum(alert => alert.Count)</strong><small>нужен ответственный</small>
+    </a>
+    <a class="queue-stat progress @(state == "assigned" ? "active" : "")" href="/Alerts?view=active&state=assigned">
+        <span>В обработке</span><strong>@activeAlerts.Where(alert => alert.Assigned).Sum(alert => alert.Count)</strong><small>есть исполнитель</small>
+    </a>
+    @if (canViewHistory)
+    {
+        <a class="queue-stat resolved @(view == "history" ? "active" : "")" href="/Alerts?view=history">
+            <span>Закрыты</span><strong>@historyAlerts.Sum(alert => alert.Count)</strong><small>в истории</small>
+        </a>
+    }
+</section>
+
+</aside>
+<div class="queue-work-area">
+<section class="queue-toolbar" aria-label="Фильтры ошибок">
+    <nav class="queue-tabs">
+        <a class="@(view == "active" ? "active" : "")" href="/Alerts?view=active">Активные</a>
+        @if (canViewHistory)
+        {
+            <a class="@(view == "history" ? "active" : "")" href="/Alerts?view=history">История</a>
+        }
+    </nav>
+
+    <div class="queue-filters">
+        <details class="error-filter-menu">
+            <summary aria-label="Выбрать тип неисправности"><span><small>Тип</small><strong>@selectedCategoryLabel</strong></span><b>@selectedCategoryCount</b><span class="filter-chevron" aria-hidden="true"><i data-lucide="chevron-down"></i></span></summary>
+            <div class="error-filter-popover" role="menu">
+                <a class="@(category == "all" ? "active" : "")" href="/Alerts?view=@view&category=all&state=@state&camera=@(inHistoryFolder ? folderKey : "")&foldersPage=@foldersPage" role="menuitem"><span>Все типы</span>@if (!inHistoryFolder) { <strong>@viewAlerts.Sum(alert => alert.Count)</strong> }</a>
+                <a class="physical @(category == "physical" ? "active" : "")" href="/Alerts?view=@view&category=physical&state=@state&camera=@(inHistoryFolder ? folderKey : "")&foldersPage=@foldersPage" role="menuitem"><span>Физические</span>@if (!inHistoryFolder) { <strong>@viewAlerts.Where(alert => alert.HasPhysical).Sum(alert => alert.Count)</strong> }</a>
+                <a class="technical @(category == "technical" ? "active" : "")" href="/Alerts?view=@view&category=technical&state=@state&camera=@(inHistoryFolder ? folderKey : "")&foldersPage=@foldersPage" role="menuitem"><span>Технические</span>@if (!inHistoryFolder) { <strong>@viewAlerts.Where(alert => alert.HasTechnical).Sum(alert => alert.Count)</strong> }</a>
+            </div>
+        </details>
+
+        @if (view == "active")
+        {
+            <details class="error-filter-menu state-menu">
+                <summary aria-label="Выбрать состояние обработки"><span><small>Обработка</small><strong>@selectedStateLabel</strong></span><b>@selectedStateCount</b><span class="filter-chevron" aria-hidden="true"><i data-lucide="chevron-down"></i></span></summary>
+                <div class="error-filter-popover" role="menu">
+                    <a class="@(state == "all" ? "active" : "")" href="/Alerts?view=active&category=@category&state=all" role="menuitem"><span>Вся очередь</span><strong>@categoryAlerts.Sum(alert => alert.Count)</strong></a>
+                    <a class="@(state == "unassigned" ? "active" : "")" href="/Alerts?view=active&category=@category&state=unassigned" role="menuitem"><span>Новые</span><strong>@categoryAlerts.Where(alert => !alert.Assigned).Sum(alert => alert.Count)</strong></a>
+                    <a class="@(state == "assigned" ? "active" : "")" href="/Alerts?view=active&category=@category&state=assigned" role="menuitem"><span>В работе</span><strong>@categoryAlerts.Where(alert => alert.Assigned).Sum(alert => alert.Count)</strong></a>
+                </div>
+            </details>
+        }
+        <span class="queue-result-count"><span>@(view == "history" ? "Карточек" : "Всего")</span><strong>@totalCount</strong></span>
+        @if (view == "active")
+        {
+            <span class="board-scroll-actions">
+                <button class="icon-button" type="button" onclick="scrollAlertBoard(-1)" aria-label="Предыдущие этапы" title="Предыдущие этапы"><i data-lucide="chevron-left"></i></button>
+                <button class="icon-button" type="button" onclick="scrollAlertBoard(1)" aria-label="Следующие этапы" title="Следующие этапы"><i data-lucide="chevron-right"></i></button>
+            </span>
+        }
+    </div>
+</section>
+
+<div id="alert-results">
+@if (view == "history")
+{
+    <div class="history-location-attribution"><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">Адресные данные © OpenStreetMap</a></div>
+}
+@if (inHistoryFolder)
+{
+    <nav class="history-folder-path" aria-label="Путь в истории">
+        <a href="/Alerts?view=history&category=@category&page=@foldersPage"><i data-lucide="arrow-left"></i> Все камеры</a>
+        <span>/</span><strong>@(selectedHistoryFolder?.Name ?? (historyCameraId.HasValue ? "Камера " + historyCameraId : "Системные ошибки"))</strong>
+        <span>@selectedHistoryFolder?.IpAddress</span>
+    </nav>
+    @if (selectedHistoryFolder != null)
+    {
+        <div class="history-camera-location"><span><i data-lucide="map-pin"></i> @(selectedHistoryFolder.StreetAddress ?? "Улица не указана")</span><small>@selectedHistoryFolder.Coordinates</small></div>
+        <partial name="_HistoryFolderStats" model="selectedHistoryFolder" />
+    }
+}
+@if (view == "history" && totalCount == 0)
+{
+    <div class="empty-state error-empty">
+        <span class="empty-icon">
+            @if (view == "history")
+            {
+                <i data-lucide="history"></i>
+            }
+            else
+            {
+                <i data-lucide="circle-check"></i>
+            }
+        </span>
+        <strong class="empty-title">
+            @(view == "history" ? "История пока пуста" : "Активных ошибок нет")
+        </strong>
+        <p class="empty-description">
+            @(view == "history"
+                ? "Закрытые менеджерами и автоматически устранённые ошибки появятся здесь."
+                : "Для выбранной категории нет неисправностей, требующих работы.")
+        </p>
+    </div>
+}
+else
+{
+    @if (view == "active" && crmStages.Count == 0)
+    {
+        <div class="empty-state error-empty">
+            <span class="empty-icon"><i data-lucide="columns-3"></i></span>
+            <strong class="empty-title">Для вашей роли этапы не настроены</strong>
+            <p class="empty-description">Обратитесь к администратору, чтобы получить доступ к колонкам очереди.</p>
+        </div>
+    }
+    else if (view == "active")
+    {
+        <section class="error-crm-board" style="--board-column-count: @crmStages.Count" aria-label="Доска активных ошибок" tabindex="0">
+            @foreach (var stageGroup in crmStages)
+            {
+                <section class="error-crm-stage @stageGroup.Key @(stageGroup.Items.Count == 0 ? "is-empty" : "")" style="--stage-color: @stageGroup.Color" data-alert-stage="@stageGroup.Key">
+                    <header class="error-crm-stage-header">
+                        <span class="error-crm-stage-mark" aria-hidden="true"></span>
+                        <span>
+                            <strong>@stageGroup.Title</strong>
+                            <small>@stageGroup.Subtitle</small>
+                            @if (canManageUsers)
+                            {
+                                <em class="error-crm-stage-roles"><i data-lucide="users-round"></i> @RoleVisibilityText(stageGroup.VisibleToRoles)</em>
+                            }
+                        </span>
+                        <b>@stageGroup.Total</b>
+                    </header>
+                    <div class="error-crm-stage-list" data-alert-drop-stage="@stageGroup.Key">
+                        @if (stageGroup.Items.Count == 0)
+                        {
+                            <div class="error-crm-stage-empty"><span>0</span><small>Нет заявок на этом этапе</small></div>
+                        }
+                        @foreach (var alert in stageGroup.Items)
+                        {
+                            var isPhysical = alert.Category == ErrorCategory.Physical;
+                            var categoryClass = isPhysical ? "physical" : "technical";
+                            var categoryLabel = isPhysical ? "Физическая" : "Техническая";
+                            var managerName = !string.IsNullOrWhiteSpace(alert.AssignedToDisplayName)
+                                ? alert.AssignedToDisplayName
+                                : alert.AssignedToUsername;
+                            var useColumnColor = !stageGroup.Key.Equals("new", StringComparison.OrdinalIgnoreCase);
+                            var cardStyle = useColumnColor ? $"--error-stage-color: {stageGroup.Color};" : $"--error-stage-color: var(--{(alert.Severity == AlertSeverity.Critical ? "danger" : "warning")});";
+                            var canEditAlert = canWork &&
+                                (canManageUsers || !alert.AssignedToUserId.HasValue || alert.AssignedToUserId == currentUserId);
+                            var canStartHandoff = canWork &&
+                                (canManageUsers || alert.AssignedToUserId == currentUserId);
+                            var cardIssues = alert.Issues
+                                .OrderBy(issue => issue.RecoveredAt.HasValue)
+                                .ThenByDescending(issue => issue.StartedAt)
+                                .ToList();
+                            var primaryIssue = cardIssues.FirstOrDefault();
+                            var localizedTitle = primaryIssue == null
+                                ? LocalizedAlertTitle(alert.AlertType, alert.Title, alert.Description)
+                                : LocalizedAlertTitle(primaryIssue.AlertType, primaryIssue.Title, primaryIssue.Description);
+                            var primaryCategory = primaryIssue?.Category ?? alert.Category;
+                            var primaryCategoryClass = primaryCategory == ErrorCategory.Physical ? "physical" : "technical";
+                            var primaryCategoryLabel = primaryCategory == ErrorCategory.Physical ? "Физическая" : "Техническая";
+                            var localizedDescription = LocalizedAlertDescription(alert.AlertType, alert.Description);
+                            var issueCount = Math.Max(1, alert.Issues.Count);
+                            var serialNumber = AlertSerialNumber.Format(alert.Camera?.Name, alert.CameraSequenceNumber, alert.Id);
+
+                            <details class="error-crm-ticket @(alert.Severity == AlertSeverity.Critical ? "critical" : "warning") @primaryCategoryClass" style="@cardStyle" data-card-layout="incident-v3" data-alert-id="@alert.Id" data-alert-stage="@stageGroup.Key" draggable="@canEditAlert.ToString().ToLowerInvariant()" ontoggle="recordAlertViewed(this, @alert.Id); loadAlertHandoffs(this, @alert.Id)">
+                                <summary class="error-crm-ticket-summary" aria-haspopup="dialog" aria-label="Открыть карточку @serialNumber">
+                                    <span class="ticket-summary-topline">
+                                        <span class="error-crm-ticket-id">@serialNumber</span>
+                                        <span class="error-crm-summary-type @primaryCategoryClass">@primaryCategoryLabel</span>
+                                    </span>
+                                    <div class="error-crm-summary-error">
+                                        <strong class="error-crm-summary-error-title"><span>@localizedTitle</span></strong>
+                                        <div class="error-crm-issue-picker">
+                                            <button class="error-crm-summary-count" type="button" data-issue-total="@issueCount" aria-expanded="false" aria-haspopup="listbox" onclick="toggleAlertIssueMenu(event, this)">
+                                                <span class="error-crm-summary-position">1 из @issueCount</span><i data-lucide="chevron-down" aria-hidden="true"></i>
+                                            </button>
+                                        </div>
+                                        <div class="error-crm-issue-menu" role="listbox" aria-label="Ошибки камеры" hidden>
+                                            @if (cardIssues.Count > 0)
+                                            {
+                                                @for (var issueIndex = 0; issueIndex < cardIssues.Count; issueIndex++)
+                                                {
+                                                    var issue = cardIssues[issueIndex];
+                                                    var issueTitle = LocalizedAlertTitle(issue.AlertType, issue.Title, issue.Description);
+                                                    var issueCategoryClass = issue.Category == ErrorCategory.Physical ? "physical" : "technical";
+                                                    var issueCategoryLabel = issue.Category == ErrorCategory.Physical ? "Физическая" : "Техническая";
+                                                    <button class="error-crm-issue-option @(issueIndex == 0 ? "is-selected" : "")" type="button" role="option" aria-selected="@(issueIndex == 0 ? "true" : "false")" data-issue-id="@issue.Id" data-issue-position="@(issueIndex + 1)" data-issue-title="@issueTitle" data-issue-category="@issueCategoryClass" data-issue-category-label="@issueCategoryLabel" onclick="selectAlertIssue(event, this)">
+                                                        <span><strong>@issueTitle</strong><small>@issueCategoryLabel · @Tashkent(issue.StartedAt)</small></span>
+                                                        <i data-lucide="check" aria-hidden="true"></i>
+                                                    </button>
+                                                }
+                                            }
+                                            else
+                                            {
+                                                <button class="error-crm-issue-option is-selected" type="button" role="option" aria-selected="true" data-issue-id="alert-@alert.Id" data-issue-position="1" data-issue-title="@localizedTitle" data-issue-category="@categoryClass" data-issue-category-label="@categoryLabel" onclick="selectAlertIssue(event, this)">
+                                                    <span><strong>@localizedTitle</strong><small>@categoryLabel · @Tashkent(alert.CreatedAt)</small></span>
+                                                    <i data-lucide="check" aria-hidden="true"></i>
+                                                </button>
+                                            }
+                                        </div>
+                                    </div>
+                                    <span class="error-crm-summary-camera">
+                                        <strong>@(alert.Camera != null ? $"Камера {alert.Camera.Name}" : "Системная ошибка")</strong>
+                                        <small>@(alert.Camera?.IpAddress ?? "Без IP")</small>
+                                    </span>
+                                    <div class="ticket-summary-footer">
+                                        <span class="ticket-summary-time"><small>Начало ошибки</small><strong>@Tashkent(alert.CreatedAt)</strong></span>
+                                        <button class="error-crm-summary-chevron" type="button" title="Открыть карточку" aria-label="Открыть карточку @serialNumber"><i data-lucide="maximize-2" aria-hidden="true"></i></button>
+                                    </div>
+                                </summary>
+                                <div class="error-crm-ticket-body">
+                                    <partial name="_AlertIssues" model="alert" />
+                                    <div class="error-crm-ticket-topline">
+                                        <span class="error-crm-ticket-id">@serialNumber</span>
+                                        <span class="error-crm-priority">@(alert.Severity == AlertSeverity.Critical ? "Критическая" : "Предупреждение")</span>
+                                    </div>
+                                    @if (alert.Issues.Count == 0 && !string.IsNullOrWhiteSpace(localizedDescription))
+                                    {
+                                        <p>@localizedDescription</p>
+                                    }
+
+                                    @if (alert.RecoveryDetectedAt.HasValue)
+                                    {
+                                        <div class="error-crm-report-ready"><i data-lucide="circle-check"></i> Восстановление подтверждено проверкой: @Tashkent(alert.RecoveryDetectedAt.Value)</div>
+                                    }
+                                    @if (isPhysical && (!alert.RecoveryDetectedAt.HasValue || alert.ServiceNotified))
+                                    {
+                                        <div class="service-notice @(alert.ServiceNotified ? "notified" : "pending")">
+                                            <span class="status-dot @(alert.ServiceNotified ? "online" : "suspect")"></span>
+                                            @(alert.ServiceNotified ? "Профильная служба уведомлена" : "Требуется уведомить профильную службу")
+                                        </div>
+                                    }
+                                    @if (!string.IsNullOrWhiteSpace(alert.WorkReport))
+                                    {
+                                        <div class="error-crm-report-ready"><i data-lucide="circle-check"></i> Отчёт о работе заполнен</div>
+                                    }
+                                    <section class="alert-handoff-panel" data-alert-handoffs data-alert-id="@alert.Id" data-can-create="@canStartHandoff.ToString().ToLowerInvariant()">
+                                        <div class="alert-handoff-loading"><i data-lucide="loader-circle" class="icon-spin"></i> Загрузка передач...</div>
+                                    </section>
+                                </div>
+
+                                <footer class="error-crm-ticket-footer">
+                                    <span class="error-crm-owner @(!string.IsNullOrWhiteSpace(managerName) ? "" : "unassigned")">
+                                        <i>@Initials(managerName)</i>
+                                        <span>
+                                            <small>Ответственный</small>
+                                            <strong>@(!string.IsNullOrWhiteSpace(managerName) ? managerName : "Не назначен")</strong>
+                                        </span>
+                                    </span>
+                                    @if (canWork)
+                                    {
+                                        <span class="error-crm-ticket-actions">
+                                            @if (!alert.AssignedToUserId.HasValue)
+                                            {
+                                                <button class="btn btn-sm btn-secondary" type="button" onclick="takeError(@alert.Id, this)"><i data-lucide="user-check"></i> Назначить себе</button>
+                                            }
+                                            @if (canEditAlert)
+                                            {
+                                                <button class="btn btn-sm btn-primary error-edit-button"
+                                                        type="button"
+                                                        data-alert-id="@alert.Id"
+                                                        data-alert-title="@localizedTitle"
+                                                        data-category="@alert.Category"
+                                                        data-assignee-id="@alert.AssignedToUserId"
+                                                        data-work-report="@alert.WorkReport"
+                                                        data-service-notified="@alert.ServiceNotified.ToString().ToLowerInvariant()"
+                                                        data-recovered="@alert.RecoveryDetectedAt.HasValue.ToString().ToLowerInvariant()"
+                                                        onclick="openErrorEditor(this)">
+                                                    <i data-lucide="folder-open"></i> Открыть заявку
+                                                </button>
+                                            }
+                                        </span>
+                                    }
+                                </footer>
+                            </details>
+                        }
+                    </div>
+                </section>
+            }
+        </section>
+    }
+    else if (view == "history" && !inHistoryFolder)
+    {
+        <section class="history-folders" aria-label="История по камерам">
+        @foreach (var folder in historyFolders)
+        {
+            <a class="history-folder" data-history-camera="@(folder.CameraId?.ToString() ?? "system")"
+               href="/Alerts?view=history&category=@category&camera=@(folder.CameraId?.ToString() ?? "system")&foldersPage=@currentPage">
+                <header class="history-folder-heading">
+                    <span><strong>@(folder.Name ?? (folder.CameraId.HasValue ? "Камера " + folder.CameraId : "Системные ошибки"))</strong><small>@(folder.IpAddress ?? (folder.CameraId.HasValue ? "IP не указан" : "Без привязки к камере"))</small></span>
+                    <i data-lucide="chevron-right" class="history-folder-chevron"></i>
+                </header>
+                @if (folder.CameraId.HasValue)
+                {
+                    <div class="history-camera-location"><span><i data-lucide="map-pin"></i> @(folder.StreetAddress ?? "Улица не указана")</span><small title="Широта, долгота">@folder.Coordinates</small></div>
+                }
+                <partial name="_HistoryFolderStats" model="folder" />
+                <footer><span>Карточек: @folder.Cases</span><span>Последнее закрытие <time>@(folder.LastClosedAt.HasValue ? Tashkent(folder.LastClosedAt.Value) : "Дата не указана")</time></span></footer>
+            </a>
+        }
+        </section>
+    }
+    else
+    {
+    <section class="error-list" aria-label="История ошибок">
+        @foreach (var alert in pagedAlerts)
+        {
+            var isPhysical = alert.Category == ErrorCategory.Physical;
+            var severityLabel = alert.Severity switch
+            {
+                AlertSeverity.Critical => "Критическая",
+                AlertSeverity.Warning => "Предупреждение",
+                _ => "Информация"
+            };
+            var severityClass = alert.Severity == AlertSeverity.Critical ? "critical" : "warning";
+            var categoryClass = isPhysical ? "physical" : "technical";
+            var categoryLabel = isPhysical ? "Физическая" : "Техническая";
+            var managerName = !string.IsNullOrWhiteSpace(alert.AssignedToDisplayName)
+                ? alert.AssignedToDisplayName
+                : alert.AssignedToUsername;
+            var resolvedBy = !string.IsNullOrWhiteSpace(alert.ResolvedByDisplayName)
+                ? alert.ResolvedByDisplayName
+                : alert.ResolvedByUsername;
+            var isAssigned = alert.AssignedToUserId.HasValue || !string.IsNullOrWhiteSpace(managerName);
+            var hasReport = !string.IsNullOrWhiteSpace(alert.WorkReport);
+            var isSystemResolution = string.Equals(alert.ResolvedByUsername, "system", StringComparison.OrdinalIgnoreCase);
+            var workflowLabel = alert.AutoResolved
+                ? (isSystemResolution ? "Автоматически" : "Закрыта")
+                : !isAssigned
+                    ? "Новая"
+                    : hasReport
+                        ? "Готова к закрытию"
+                        : "В работе";
+            var workflowClass = alert.AutoResolved
+                ? "resolved"
+                : !isAssigned
+                    ? "new"
+                    : hasReport
+                        ? "ready"
+                        : "working";
+            var canEditAlert = canWork &&
+                (canManageUsers || !alert.AssignedToUserId.HasValue || alert.AssignedToUserId == currentUserId);
+            var localizedTitle = LocalizedAlertTitle(alert.AlertType, alert.Title, alert.Description);
+            var localizedDescription = LocalizedAlertDescription(alert.AlertType, alert.Description);
+            var historyIssueDescriptions = alert.Issues
+                .OrderBy(issue => issue.StartedAt)
+                .Select(issue => LocalizedAlertDescription(issue.AlertType, issue.Description))
+                .Where(description => !string.IsNullOrWhiteSpace(description))
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            if (historyIssueDescriptions.Count == 0 && !string.IsNullOrWhiteSpace(localizedDescription))
+                historyIssueDescriptions.Add(localizedDescription);
+            var serialNumber = AlertSerialNumber.Format(alert.Camera?.Name, alert.CameraSequenceNumber, alert.Id);
+
+            <article class="error-item history-record @severityClass @categoryClass" data-alert-id="@alert.Id">
+                <div class="error-item-rail" aria-hidden="true"></div>
+                <div class="error-item-symbol @categoryClass" aria-hidden="true">
+                    <span><i data-lucide="@(alert.Severity == AlertSeverity.Critical ? "triangle-alert" : "circle-alert")"></i></span>
+                    <small>@(isPhysical ? "ФИЗ" : "ТЕХ")</small>
+                </div>
+                <div class="error-item-main">
+                    <header class="error-item-heading">
+                        <div class="error-item-title-row">
+                            <div class="error-item-title-group">
+                                <h2>@localizedTitle</h2>
+                                <span class="error-category-badge @categoryClass">@categoryLabel</span>
+                            </div>
+                            <span class="error-number" title="Серийный номер карточки" aria-label="Серийный номер карточки @serialNumber">№ @serialNumber</span>
+                        </div>
+                    </header>
+
+                    @if (historyIssueDescriptions.Count > 0)
+                    {
+                        <div class="history-error-highlight" aria-label="Неисправности">
+                            @foreach (var description in historyIssueDescriptions)
+                            {
+                                <p><i data-lucide="triangle-alert"></i><span>@description</span></p>
+                            }
+                        </div>
+                    }
+
+                    <div class="error-lifecycle" aria-label="Этапы обработки ошибки">
+                        <span class="complete" title="Ошибка обнаружена">
+                            <i></i><small>Обнаружена</small>
+                        </span>
+                        <span class="@(isAssigned ? "complete" : isSystemResolution ? "system" : "pending")" title="Назначение ответственного">
+                            <i></i><small>@(isSystemResolution && !isAssigned ? "Автообработка" : "Назначена")</small>
+                        </span>
+                        <span class="@(hasReport ? "complete" : isSystemResolution ? "system" : "pending")" title="Выполнение работ">
+                            <i></i><small>@(isSystemResolution && !hasReport ? "Восстановлена" : "Работа")</small>
+                        </span>
+                        <span class="@(alert.AutoResolved ? "complete" : "pending")" title="Закрытие ошибки">
+                            <i></i><small>Закрыта</small>
+                        </span>
+                    </div>
+
+                    <div class="error-metadata history-metadata-compact">
+                        <div class="history-meta-column history-meta-period">
+                            <span class="history-meta-line"><small>Обнаружена</small><strong class="timestamp">@Tashkent(alert.CreatedAt)</strong></span>
+                            <span class="history-meta-line"><small>Закрыта</small><strong class="timestamp">@(alert.ResolvedAt.HasValue ? Tashkent(alert.ResolvedAt.Value) : "Время не зафиксировано")</strong></span>
+                        </div>
+                        <div class="history-meta-column history-meta-people">
+                            <span class="history-meta-line"><small>Ответственный</small><strong>@(!string.IsNullOrWhiteSpace(managerName) ? managerName : "Не назначен")</strong></span>
+                            <span class="history-meta-line"><small>Закрыл</small><strong>@(string.IsNullOrWhiteSpace(resolvedBy) ? "Система" : resolvedBy)</strong></span>
+                        </div>
+                    </div>
+
+                    <div class="error-history-content">
+                    @if (!string.IsNullOrWhiteSpace(alert.WorkReport) || view == "history")
+                    {
+                        <div class="error-work-report">
+                            <span>Отчёт о работе</span>
+                            <p>@(string.IsNullOrWhiteSpace(alert.WorkReport) ? "Ошибка устранена автоматически после восстановления камеры." : alert.WorkReport)</p>
+                        </div>
+                    }
+
+                    </div>
+                    @if (view == "history")
+                    {
+                        <details class="error-audit-panel" data-alert-history="@alert.Id" ontoggle="loadAlertHistory(this, @alert.Id)">
+                            <summary>
+                                <span><i data-lucide="history"></i><strong>История изменений</strong></span>
+                                <i class="error-audit-chevron" data-lucide="chevron-down"></i>
+                            </summary>
+                            <div class="error-audit-list" data-alert-history-list>
+                                <span class="error-audit-placeholder">Откройте историю для загрузки действий</span>
+                            </div>
+                        </details>
+                    }
+
+                    @if (alert.RecoveryDetectedAt.HasValue)
+                    {
+                        <div class="error-crm-report-ready"><i data-lucide="circle-check"></i> Восстановление подтверждено проверкой: @Tashkent(alert.RecoveryDetectedAt.Value)</div>
+                    }
+                    @if (isPhysical && ((!alert.AutoResolved && !alert.RecoveryDetectedAt.HasValue) || alert.ServiceNotified))
+                    {
+                        <div class="service-notice @(alert.ServiceNotified ? "notified" : "pending")">
+                            <span class="status-dot @(alert.ServiceNotified ? "online" : "suspect")"></span>
+                            @(alert.ServiceNotified
+                                ? $"Профильная служба уведомлена{(alert.ServiceNotifiedAt.HasValue ? $" · {Tashkent(alert.ServiceNotifiedAt.Value)}" : "")}{(!string.IsNullOrWhiteSpace(alert.ServiceNotifiedByUsername) ? $" · {alert.ServiceNotifiedByUsername}" : "")}"
+                                : "Профильная служба ещё не уведомлена")
+                        </div>
+                    }
+                    <div class="history-record-actions">
+                        <button class="btn btn-secondary btn-sm" type="button" onclick="openTransferredAlert(@alert.Id)"><i data-lucide="maximize-2"></i> Открыть карточку</button>
+                    </div>
+                </div>
+
+                @if (view == "active" && canWork)
+                {
+                    <div class="error-item-actions">
+                        <span class="error-action-caption">Работа с заявкой</span>
+                        @if (!alert.AssignedToUserId.HasValue)
+                        {
+                            <button class="btn btn-secondary" type="button" onclick="takeError(@alert.Id, this)"><i data-lucide="user-check"></i> В работу</button>
+                        }
+                        @if (canEditAlert)
+                        {
+                            <button class="btn btn-primary error-edit-button"
+                                    type="button"
+                                    data-alert-id="@alert.Id"
+                                    data-alert-title="@localizedTitle"
+                                    data-category="@alert.Category"
+                                    data-assignee-id="@alert.AssignedToUserId"
+                                    data-work-report="@alert.WorkReport"
+                                    data-service-notified="@alert.ServiceNotified.ToString().ToLowerInvariant()"
+                                    data-recovered="@alert.RecoveryDetectedAt.HasValue.ToString().ToLowerInvariant()"
+                                    onclick="openErrorEditor(this)">
+                                <i data-lucide="folder-open"></i> Открыть карточку
+                            </button>
+                        }
+                    </div>
+                }
+            </article>
+        }
+    </section>
+    }
+
+    @if (totalPages > 1)
+    {
+        <nav class="error-pagination" aria-label="Страницы истории">
+            <a class="btn btn-secondary @(currentPage == 1 ? "disabled" : "")"
+               href="/Alerts?view=@view&category=@category&state=@state&camera=@(inHistoryFolder ? folderKey : "")&foldersPage=@foldersPage&page=@Math.Max(1, currentPage - 1)"><i data-lucide="arrow-left"></i> Назад</a>
+            <span>Страница @currentPage из @totalPages</span>
+            <a class="btn btn-secondary @(currentPage == totalPages ? "disabled" : "")"
+               href="/Alerts?view=@view&category=@category&state=@state&camera=@(inHistoryFolder ? folderKey : "")&foldersPage=@foldersPage&page=@Math.Min(totalPages, currentPage + 1)">Вперёд <i data-lucide="arrow-right"></i></a>
+        </nav>
+    }
+}
+
+</div>
+
+</div>
+</div>
+<script type="application/json" id="alert-board-live-data">@Html.Raw(JsonSerializer.Serialize(new { managers = managerPayload, columns = boardColumnPayload }))</script>
+<script>
+    function scrollAlertBoard(direction) {
+        const board = document.querySelector('.error-crm-board');
+        const column = board?.querySelector('.error-crm-stage');
+        if (!column) return;
+        const gap = parseFloat(getComputedStyle(board).columnGap) || 0;
+        board.scrollBy({ left: direction * (column.getBoundingClientRect().width + gap), behavior: 'smooth' });
+    }
+
+    const errorManagers = @Html.Raw(JsonSerializer.Serialize(managerPayload));
+    const errorCurrentUserId = @currentUserId;
+    const errorCanReview = @((currentRole == "Admin" || currentRole == "Operator") && canWork ? "true" : "false");
+    const errorCanManageUsers = @(canManageUsers ? "true" : "false");
+    const alertBoardColumns = @Html.Raw(JsonSerializer.Serialize(boardColumnPayload));
+    const alertBoardRoles = [
+        { key: 'Admin', label: 'Администратор' },
+        { key: 'Operator', label: 'Оператор' },
+        { key: 'Technician', label: 'Техник' },
+        { key: 'Viewer', label: 'Наблюдатель' }
+    ];
+    let alertBoardReorderPending = false;
+    let alertHandoffReasonsPromise = null;
+    let alertHandoffPreferencesPromise = null;
+
+    const alertAuditFieldLabels = {
+        category: 'Тип неисправности',
+        severity: 'Важность',
+        title: 'Ошибка',
+        description: 'Описание',
+        workflowStage: 'Этап обработки',
+        assignedToDisplayName: 'Ответственный',
+        assignedByUsername: 'Кто назначил',
+        workReport: 'Отчёт о работе',
+        serviceNotified: 'Уведомление службы',
+        serviceNotifiedByUsername: 'Кто уведомил службу',
+        resolvedByDisplayName: 'Кто закрыл',
+        recoveryDetectedAt: 'Восстановление подтверждено проверкой',
+        autoResolved: 'Карточка закрыта'
+    };
+    const alertAuditEventPresentation = {
+        created: { label: 'Создание', icon: 'plus' },
+        viewed: { label: 'Просмотр карточки', icon: 'eye' },
+        assigned: { label: 'Назначение', icon: 'user-check' },
+        stage_changed: { label: 'Перемещение', icon: 'arrow-right' },
+        work_updated: { label: 'Изменение данных', icon: 'pencil' },
+        handoff_created: { label: 'Передача работы', icon: 'send' },
+        handoff_viewed: { label: 'Передача просмотрена', icon: 'eye' },
+        handoff_accepted: { label: 'Работа принята', icon: 'badge-check' },
+        handoff_forwarded: { label: 'Передано дальше', icon: 'forward' },
+        handoff_completed: { label: 'Переданная работа завершена', icon: 'circle-check' },
+        handoff_rejected: { label: 'Работа возвращена', icon: 'undo-2' },
+        resolved: { label: 'Закрытие', icon: 'circle-check' },
+        auto_resolved: { label: 'Автоматическое закрытие', icon: 'refresh-cw' },
+        recovery_detected: { label: 'Восстановление обнаружено', icon: 'circle-check' },
+        recovery_lost: { label: 'Неисправность вернулась', icon: 'rotate-ccw' },
+        issue_added: { label: 'Добавлена ошибка', icon: 'plus' },
+        issue_updated: { label: 'Ошибка уточнена', icon: 'pencil' },
+        issue_recovered: { label: 'Ошибка устранена', icon: 'circle-check' },
+        case_merged: { label: 'Карточки объединены', icon: 'combine' },
+        legacy_imported: { label: 'Перенос старой записи', icon: 'history' }
+    };
+
+    function recordAlertViewed(details, alertId) {
+        if (!details.open || details.dataset.viewRecorded === 'true') return;
+        details.dataset.viewRecorded = 'true';
+        apiFetch('/api/alerts/' + alertId + '/viewed', { method: 'POST' }).catch(function (error) {
+            details.dataset.viewRecorded = 'false';
+            if (error.status !== 403 && error.status !== 401)
+                console.warn('Не удалось записать просмотр ошибки:', error.message);
+        });
+    }
+
+    async function loadAlertHistory(details, alertId) {
+        if (!details.open || details.dataset.loaded === 'true' || details.dataset.loading === 'true') return;
+        const list = details.querySelector('[data-alert-history-list]');
+        if (!list) return;
+
+        details.dataset.loading = 'true';
+        list.innerHTML = '<span class="error-audit-placeholder text-action"><i data-lucide="loader-circle" class="icon-spin"></i>Загрузка истории...</span>';
+        renderIcons();
+        try {
+            const events = await apiFetch('/api/alerts/' + alertId + '/history');
+            list.innerHTML = renderAlertAuditEvents(events);
+            details.dataset.loaded = 'true';
+            renderIcons();
+        } catch (error) {
+            list.innerHTML = '<button class="btn btn-sm btn-danger" type="button" onclick="event.preventDefault();event.stopPropagation();this.closest(\'details\').dataset.loading=\'false\';loadAlertHistory(this.closest(\'details\'),' + alertId + ')"><i data-lucide="refresh-cw"></i> Повторить загрузку</button><span class="error-audit-error">' + escapeHtml(error.message) + '</span>';
+            renderIcons();
+        } finally {
+            details.dataset.loading = 'false';
+        }
+    }
+
+    function renderAlertAuditEvents(events) {
+        if (!Array.isArray(events) || events.length === 0)
+            return '<span class="error-audit-placeholder">Записей об изменениях пока нет</span>';
+
+        return events.map(function (item, index) {
+            const presentation = alertAuditEventPresentation[item.eventType] || { label: 'Изменение', icon: 'pencil' };
+            const actorName = item.actorDisplayName || item.actorUsername || 'Система';
+            const actorLogin = item.actorUsername && item.actorUsername !== 'system'
+                ? '<small>@@' + escapeHtml(item.actorUsername) + '</small>'
+                : '<small>системное действие</small>';
+            const date = new Date(item.createdAt).toLocaleString(window.uiLocale?.intlLocale || 'ru-RU', {
+                timeZone: 'Asia/Tashkent',
+                day: '2-digit', month: '2-digit', year: 'numeric',
+                hour: '2-digit', minute: '2-digit', second: '2-digit'
+            });
+            return '<article class="error-audit-event">' +
+                '<span class="error-audit-line" aria-hidden="true"></span>' +
+                '<span class="error-audit-icon"><i data-lucide="' + presentation.icon + '"></i></span>' +
+                '<div class="error-audit-content">' +
+                    '<div class="error-audit-heading"><span><strong>' + escapeHtml(presentation.label) + '</strong><time>' + escapeHtml(date) + '</time></span><span class="error-audit-actor"><b>' + escapeHtml(actorName) + '</b>' + actorLogin + '</span></div>' +
+                    '<p>' + escapeHtml(item.summary || presentation.label) + '</p>' +
+                    renderAlertAuditChanges(item.previousValuesJson, item.newValuesJson, item.eventType) +
+                    renderHandoffAudit(parseAlertAuditState(item.newValuesJson)?.handoff) +
+                '</div>' +
+            '</article>';
+        }).join('');
+    }
+
+    function renderAlertAuditChanges(previousJson, nextJson, eventType) {
+        const previous = parseAlertAuditState(previousJson);
+        const next = parseAlertAuditState(nextJson);
+        if (eventType === 'case_merged' && previous) {
+            return '<div class="error-audit-changes">' + ['assignedToDisplayName', 'workReport', 'serviceNotified'].map(function (key) {
+                return '<div class="error-audit-change"><span>' + escapeHtml(alertAuditFieldLabels[key]) + '</span><strong>' + escapeHtml(formatAlertAuditValue(key, previous[key])) + '</strong></div>';
+            }).join('') + '</div>';
+        }
+        if (!next) return '';
+
+        const keys = Object.keys(alertAuditFieldLabels);
+        const changed = keys.filter(function (key) {
+            if (!previous) return eventType === 'created' && ['category', 'workflowStage'].includes(key);
+            return JSON.stringify(previous[key] ?? null) !== JSON.stringify(next[key] ?? null);
+        });
+        if (!changed.length) return '';
+
+        return '<div class="error-audit-changes">' + changed.map(function (key) {
+            const oldValue = previous ? formatAlertAuditValue(key, previous[key]) : '—';
+            const newValue = formatAlertAuditValue(key, next[key]);
+            return '<div class="error-audit-change"><span>' + escapeHtml(alertAuditFieldLabels[key]) + '</span><div><em>' + escapeHtml(oldValue) + '</em><i data-lucide="arrow-right"></i><strong>' + escapeHtml(newValue) + '</strong></div></div>';
+        }).join('') + '</div>';
+    }
+
+    function parseAlertAuditState(value) {
+        if (!value) return null;
+        try { return typeof value === 'string' ? JSON.parse(value) : value; }
+        catch (_) { return null; }
+    }
+
+    function formatAlertAuditValue(key, value) {
+        if (value === null || value === undefined || value === '') return 'Не указано';
+        if (key === 'category') return value === 'Physical' ? 'Физическая' : value === 'Technical' ? 'Техническая' : String(value);
+        if (key === 'severity') return value === 'Critical' ? 'Критическая' : value === 'Warning' ? 'Предупреждение' : 'Информация';
+        if (key === 'serviceNotified' || key === 'autoResolved') return value ? 'Да' : 'Нет';
+        if (key === 'workflowStage') {
+            const stage = alertBoardColumns.find(function (column) { return column.key === value; });
+            if (stage) return stage.title;
+            if (value === 'closed') return 'Закрыта';
+        }
+        return String(value);
+    }
+
+    async function getAlertHandoffReasons(includeInactive) {
+        if (includeInactive)
+            return await apiFetch('/api/alerts/handoff-reasons?includeInactive=true');
+        if (!alertHandoffReasonsPromise)
+            alertHandoffReasonsPromise = apiFetch('/api/alerts/handoff-reasons');
+        return await alertHandoffReasonsPromise;
+    }
+
+    async function getAlertHandoffPreferences() {
+        if (!alertHandoffPreferencesPromise)
+            alertHandoffPreferencesPromise = apiFetch('/api/notifications/preferences');
+        return await alertHandoffPreferencesPromise;
+    }
+
+    async function loadAlertHandoffs(details, alertId, force) {
+        if (!details || (!details.open && !force)) return;
+        const panel = details.querySelector('[data-alert-handoffs]');
+        if (!panel || panel.dataset.loading === 'true') return;
+        if (panel.dataset.loaded === 'true' && !force) return;
+
+        panel.dataset.loading = 'true';
+        panel.innerHTML = '<div class="alert-handoff-loading"><i data-lucide="loader-circle" class="icon-spin"></i> Загрузка передач...</div>';
+        renderIcons();
+        try {
+            const feed = await apiFetch('/api/alerts/' + alertId + '/handoffs');
+            panel.innerHTML = renderAlertHandoffs(panel, alertId, feed);
+            panel.dataset.loaded = 'true';
+            renderIcons();
+        } catch (error) {
+            panel.innerHTML = '<button class="btn btn-sm btn-secondary" type="button" onclick="reloadAlertHandoffs(' + alertId + ')"><i data-lucide="refresh-cw"></i> Повторить</button><span class="alert-handoff-error">' + escapeHtml(error.message) + '</span>';
+            renderIcons();
+        } finally {
+            panel.dataset.loading = 'false';
+        }
+    }
+
+    function renderAlertHandoffs(panel, alertId, feed) {
+        const items = Array.isArray(feed.items) ? feed.items : [];
+        const openItem = [...items].reverse().find(item => item.state === 'pending' || item.state === 'accepted');
+        const canCreate = panel.dataset.canCreate === 'true' && !openItem;
+        const createButton = canCreate
+            ? '<button class="btn btn-sm btn-secondary" type="button" onclick="openAlertHandoffEditor(' + alertId + ')"><i data-lucide="send"></i> Передать</button>'
+            : '';
+        const header = '<header class="alert-handoff-header"><span><i data-lucide="workflow"></i><strong>Передача работы</strong><small>Внутренний процесс, этап карточки не меняется</small></span><span><b>' + items.length + '</b>' + createButton + '</span></header>';
+        if (!items.length)
+            return header + '<div class="alert-handoff-empty">Работа пока не передавалась другим сотрудникам</div>';
+
+        return header + '<div class="alert-handoff-chain">' + items.map(function (item, index) {
+            const status = getAlertHandoffStatus(item);
+            const actionButtons = renderAlertHandoffActions(alertId, item);
+            const acceptance = item.acceptanceComment
+                ? '<p class="alert-handoff-note"><b>При принятии:</b> ' + escapeHtml(item.acceptanceComment) + '</p>'
+                : '';
+            const completion = item.completionComment
+                ? '<p class="alert-handoff-note"><b>Результат:</b> ' + escapeHtml(item.completionComment) + '</p>'
+                : '';
+            const dueClass = !item.completedAt && new Date(item.dueAt) < new Date() ? ' overdue' : '';
+            return '<article class="alert-handoff-item ' + escapeHtml(item.state) + dueClass + '">' +
+                '<span class="alert-handoff-index">' + (index + 1) + '</span>' +
+                '<div class="alert-handoff-main">' +
+                    '<div class="alert-handoff-route"><span><small>Передал</small><strong>' + escapeHtml(item.fromDisplayName || item.fromUsername) + '</strong></span><i data-lucide="arrow-right"></i><span><small>Получатель</small><strong>' + escapeHtml(item.toDisplayName || item.toUsername) + '</strong></span><b class="alert-handoff-state ' + escapeHtml(status.className) + '">' + escapeHtml(status.label) + '</b></div>' +
+                    '<div class="alert-handoff-reason"><strong>' + escapeHtml(item.reasonName) + '</strong><time>' + escapeHtml(formatTashkentDateTime(item.createdAt)) + '</time></div>' +
+                    '<p class="alert-handoff-note">' + escapeHtml(item.comment) + '</p>' + acceptance + completion +
+                    '<div class="alert-handoff-dates"><span>Срок: ' + escapeHtml(formatTashkentDateTime(item.dueAt)) + '</span>' +
+                        (item.viewedAt ? '<span>Просмотрено: ' + escapeHtml(formatTashkentDateTime(item.viewedAt)) + '</span>' : '') +
+                        (item.acceptedAt ? '<span>Принято: ' + escapeHtml(formatTashkentDateTime(item.acceptedAt)) + '</span>' : '') +
+                    '</div>' + actionButtons +
+                '</div>' +
+            '</article>';
+        }).join('') + '</div>';
+    }
+
+    function getAlertHandoffStatus(item) {
+        if (item.state === 'pending' && item.viewedAt) return { label: 'Просмотрено', className: 'viewed' };
+        const values = {
+            pending: { label: 'Ожидает принятия', className: 'pending' },
+            accepted: { label: 'Принято', className: 'accepted' },
+            forwarded: { label: 'Передано дальше', className: 'forwarded' },
+            completed: { label: 'Завершено', className: 'completed' },
+            rejected: { label: 'Возвращено', className: 'rejected' }
+        };
+        return values[item.state] || { label: item.state || 'Неизвестно', className: 'pending' };
+    }
+
+    function renderAlertHandoffActions(alertId, item) {
+        const buttons = [];
+        if (item.canAccept)
+            buttons.push('<button class="btn btn-sm btn-primary" type="button" onclick="acceptAlertHandoff(' + alertId + ',' + item.id + ')"><i data-lucide="badge-check"></i> Принять</button>');
+        if (item.canForward)
+            buttons.push('<button class="btn btn-sm btn-secondary" type="button" onclick="openAlertHandoffEditor(' + alertId + ',' + item.id + ')"><i data-lucide="forward"></i> Передать дальше</button>');
+        if (item.canComplete)
+            buttons.push('<button class="btn btn-sm btn-success" type="button" onclick="openAlertHandoffAction(' + alertId + ',' + item.id + ',\'complete\')"><i data-lucide="circle-check"></i> Завершить</button>');
+        if (item.canReject)
+            buttons.push('<button class="btn btn-sm btn-danger" type="button" onclick="openAlertHandoffAction(' + alertId + ',' + item.id + ',\'reject\')"><i data-lucide="undo-2"></i> Вернуть</button>');
+        return buttons.length ? '<div class="alert-handoff-actions">' + buttons.join('') + '</div>' : '';
+    }
+
+    async function openAlertHandoffEditor(alertId, parentHandoffId) {
+        try {
+            const results = await Promise.all([getAlertHandoffReasons(false), getAlertHandoffPreferences()]);
+            const reasons = Array.isArray(results[0]) ? results[0] : [];
+            const preferences = results[1] || {};
+            const recipients = errorManagers.filter(user => user.id !== errorCurrentUserId);
+            if (!recipients.length) {
+                showToast('Нет другого активного сотрудника с доступом к ошибкам', 'warning');
+                return;
+            }
+            if (!reasons.length) {
+                showToast('Администратор должен добавить внутренний статус передачи', 'warning');
+                return;
+            }
+
+            const roleNames = { Admin: 'Администратор', Operator: 'Оператор', Technician: 'Техник', Viewer: 'Наблюдатель' };
+            const body = '<form class="handoff-editor" id="handoff-editor" data-alert-id="' + alertId + '" data-parent-id="' + (parentHandoffId || '') + '">' +
+                '<div class="form-group"><label class="form-label" for="handoff-recipient">Передать сотруднику</label><select class="form-select" id="handoff-recipient">' + recipients.map(user =>
+                    '<option value="' + user.id + '">' + escapeHtml(user.displayName || user.username) + ' · ' + escapeHtml(roleNames[user.role] || user.role || '') + '</option>').join('') + '</select></div>' +
+                '<div class="form-group"><label class="form-label" for="handoff-reason">Внутренний статус / причина</label><select class="form-select" id="handoff-reason">' + reasons.map(reason =>
+                    '<option value="' + reason.id + '">' + escapeHtml(reason.name) + '</option>').join('') + '</select></div>' +
+                '<div class="form-group"><label class="form-label" for="handoff-comment">Что требуется сделать</label><textarea id="handoff-comment" rows="5" maxlength="2000" required placeholder="Опишите результат диагностики, задачу и ожидаемый результат"></textarea></div>' +
+                '<div class="form-group handoff-due-field"><label class="form-label" for="handoff-due-hours">Срок принятия, часов</label><input class="form-input" id="handoff-due-hours" type="number" min="1" max="720" value="' + Number(preferences.handoffDueHours || 24) + '" required></div>' +
+                '<div class="error-editor-status" id="handoff-editor-status"></div></form>';
+            showModal(parentHandoffId ? 'Передать работу дальше' : 'Передать работу', body,
+                '<button class="btn btn-secondary" type="button" onclick="closeModal()">Отмена</button>' +
+                '<button class="btn btn-primary" id="handoff-submit" type="button" onclick="submitAlertHandoff()"><i data-lucide="send"></i> Передать</button>');
+        } catch (error) {
+            showToast(error.message, 'error');
+        }
+    }
+
+    async function submitAlertHandoff() {
+        const form = document.getElementById('handoff-editor');
+        if (!form) return;
+        const alertId = Number(form.dataset.alertId);
+        const parentId = Number(form.dataset.parentId || 0);
+        const payload = {
+            toUserId: Number(document.getElementById('handoff-recipient').value),
+            reasonId: Number(document.getElementById('handoff-reason').value),
+            comment: document.getElementById('handoff-comment').value.trim(),
+            dueHours: Number(document.getElementById('handoff-due-hours').value)
+        };
+        const status = document.getElementById('handoff-editor-status');
+        const submit = document.getElementById('handoff-submit');
+        if (!payload.comment) {
+            status.textContent = 'Добавьте комментарий к передаче';
+            status.className = 'error-editor-status error';
+            return;
+        }
+        submit.disabled = true;
+        try {
+            const url = parentId
+                ? '/api/alerts/' + alertId + '/handoffs/' + parentId + '/forward'
+                : '/api/alerts/' + alertId + '/handoffs';
+            await apiFetch(url, { method: 'POST', body: payload });
+            closeModal({ notify: false });
+            showToast(parentId ? 'Работа передана следующему сотруднику' : 'Работа передана', 'success');
+            reloadAlertHandoffs(alertId);
+            if (typeof window.loadAccountNotifications === 'function') window.loadAccountNotifications();
+        } catch (error) {
+            status.textContent = error.message;
+            status.className = 'error-editor-status error';
+            submit.disabled = false;
+        }
+    }
+
+    async function acceptAlertHandoff(alertId, handoffId) {
+        try {
+            await apiFetch('/api/alerts/' + alertId + '/handoffs/' + handoffId + '/accept', { method: 'POST', body: {} });
+            showToast('Переданная работа принята', 'success');
+            reloadAlertHandoffs(alertId);
+        } catch (error) {
+            showToast(error.message, 'error');
+        }
+    }
+
+    function openAlertHandoffAction(alertId, handoffId, action) {
+        const isComplete = action === 'complete';
+        const body = '<form class="handoff-editor" id="handoff-action-form" data-alert-id="' + alertId + '" data-handoff-id="' + handoffId + '" data-action="' + action + '">' +
+            '<p class="modal-message">' + (isComplete ? 'Зафиксируйте выполненную работу и результат.' : 'Укажите причину возврата отправителю.') + '</p>' +
+            '<div class="form-group"><label class="form-label" for="handoff-action-comment">Комментарий</label><textarea id="handoff-action-comment" rows="5" maxlength="2000" required></textarea></div>' +
+            '<div class="error-editor-status" id="handoff-action-status"></div></form>';
+        showModal(isComplete ? 'Завершить переданную работу' : 'Вернуть работу', body,
+            '<button class="btn btn-secondary" type="button" onclick="closeModal()">Отмена</button>' +
+            '<button class="btn ' + (isComplete ? 'btn-success' : 'btn-danger') + '" id="handoff-action-submit" type="button" onclick="submitAlertHandoffAction()">' + (isComplete ? 'Завершить' : 'Вернуть') + '</button>');
+    }
+
+    async function submitAlertHandoffAction() {
+        const form = document.getElementById('handoff-action-form');
+        if (!form) return;
+        const comment = document.getElementById('handoff-action-comment').value.trim();
+        const status = document.getElementById('handoff-action-status');
+        if (!comment) {
+            status.textContent = 'Комментарий обязателен';
+            status.className = 'error-editor-status error';
+            return;
+        }
+        const alertId = Number(form.dataset.alertId);
+        const handoffId = Number(form.dataset.handoffId);
+        const action = form.dataset.action;
+        const submit = document.getElementById('handoff-action-submit');
+        submit.disabled = true;
+        try {
+            await apiFetch('/api/alerts/' + alertId + '/handoffs/' + handoffId + '/' + action, { method: 'POST', body: { comment: comment } });
+            closeModal({ notify: false });
+            showToast(action === 'complete' ? 'Переданная работа завершена' : 'Работа возвращена отправителю', 'success');
+            reloadAlertHandoffs(alertId);
+            if (typeof window.loadAccountNotifications === 'function') window.loadAccountNotifications();
+        } catch (error) {
+            status.textContent = error.message;
+            status.className = 'error-editor-status error';
+            submit.disabled = false;
+        }
+    }
+
+    function reloadAlertHandoffs(alertId) {
+        const details = document.getElementById('transferred-alert-details');
+        const refresh = !document.getElementById('modal-container').hidden &&
+            Number(details?.dataset.alertId) === Number(alertId);
+        return openTransferredAlert(alertId, refresh);
+    }
+
+    let alertDetailsRequest = 0;
+
+    function renderAlertDetailText(value, key) {
+        const text = key === 'description' ? localizeCameraError(value) : String(value || '');
+        if (text.length <= 220) return '<p class="alert-detail-text">' + escapeHtml(text) + '</p>';
+        return '<details class="alert-detail-longtext" data-detail-fold="' + key + '">' +
+            '<summary><span class="alert-detail-excerpt">' + escapeHtml(text.slice(0, 180)) + '…</span>' +
+            '<span class="alert-detail-expand-label">Подробности <i data-lucide="chevron-down"></i></span></summary>' +
+            '<p class="alert-detail-text">' + escapeHtml(text) + '</p></details>';
+    }
+
+    function renderAlertModalHeader(data) {
+        const alert = data.alert || {};
+        const physical = alert.category === 1 || alert.category === 'Physical';
+        const severityTone = alert.severity === 2 || alert.severity === 'Critical' ? 'danger'
+            : alert.severity === 0 || alert.severity === 'Info' ? 'info' : 'warning';
+        const severity = { danger: 'Критическая', warning: 'Предупреждение', info: 'Информация' }[severityTone];
+        return {
+            identityHtml: '<span class="modal-camera-identity"><strong>' + escapeHtml(data.cameraName || 'Системная ошибка') +
+                '</strong><code>' + escapeHtml(data.cameraIp || 'Без IP') + '</code></span>',
+            title: data.displayTitle || alert.title || 'Ошибка камеры',
+            locationHtml: '<span><i data-lucide="map-pin"></i>' + escapeHtml(data.cameraLocation || 'Локация не указана') + '</span>',
+            titleBadgesHtml: '<span class="error-category-badge ' + (physical ? 'physical' : 'technical') + '">' +
+                (physical ? 'Физическая' : 'Техническая') + '</span><strong class="alert-detail-stage-label">' +
+                escapeHtml(data.stageTitle || 'Этап не указан') + '</strong>',
+            severityHtml: '<span class="alert-detail-severity ' + severityTone + '"><i data-lucide="' +
+                (severityTone === 'danger' ? 'circle-alert' : 'info') + '"></i>' + severity + '</span>'
+        };
+    }
+
+    function renderFullAlertDetails(data, historyOpen) {
+        const alert = data.alert;
+        const id = Number(alert.id);
+        const physical = alert.category === 1 || alert.category === 'Physical';
+        const date = value => value ? formatTashkentDateTime(value) : 'Не указано';
+        const cameraStatus = ({
+            online: 'Онлайн',
+            offline: 'Офлайн',
+            suspect: 'Требует проверки',
+            unknown: 'Нет данных'
+        })[String(data.cameraStatus || 'unknown').toLowerCase()] || 'Нет данных';
+        const cameraFields = [
+            ['Прошивка', data.cameraFirmwareVersion || 'Не указана'],
+            ['Состояние камеры', cameraStatus]
+        ];
+        const requestFields = [
+            ['Ошибка появилась', date(alert.createdAt)],
+            ['Ответственный', alert.assignedToDisplayName || alert.assignedToUsername || 'Не назначен'],
+            ['Назначена', alert.assignedAt ? date(alert.assignedAt) : 'Не назначена']
+        ];
+        if (alert.recoveryDetectedAt) requestFields.push(['Восстановление подтверждено', date(alert.recoveryDetectedAt)]);
+        if (alert.resolvedAt) requestFields.push(['Закрыта', date(alert.resolvedAt)]);
+        if (alert.resolvedByDisplayName || alert.resolvedByUsername)
+            requestFields.push(['Закрыл', alert.resolvedByDisplayName || alert.resolvedByUsername]);
+        const stage = alert.workflowStage || (alert.assignedToUserId ? 'assigned' : 'new');
+        const stageControl = data.canEdit && data.stages?.length
+            ? '<form class="alert-detail-stage-form" onsubmit="event.preventDefault();changeOpenedAlertStage(this)">' +
+                '<label for="alert-detail-stage"><strong>Этап обработки:</strong></label><select class="form-select" id="alert-detail-stage">' +
+                data.stages.map(item => '<option value="' + escapeHtml(item.key) + '"' + (item.key === stage ? ' selected' : '') + '>' + escapeHtml(item.title) + '</option>').join('') +
+                '</select><button class="btn btn-secondary" type="submit"><i data-lucide="arrow-right"></i> Переместить</button></form>' : '';
+        const severityTone = alert.severity === 2 || alert.severity === 'Critical' ? 'danger'
+            : alert.severity === 0 || alert.severity === 'Info' ? 'info' : 'warning';
+        return '<details open class="alert-detail-view" id="transferred-alert-details" data-alert-id="' + id + '">' +
+            '<summary class="alert-detail-heading is-structural">Данные карточки ошибки</summary>' +
+            '<div class="alert-detail-overview-grid">' +
+            '<section class="alert-detail-section alert-detail-overview alert-detail-camera" aria-label="Данные камеры">' +
+            '<header class="alert-detail-section-heading"><h3><i data-lucide="cctv"></i> Камера</h3></header>' +
+            '<dl class="alert-detail-metadata">' + cameraFields.map(([label, value]) => '<div><dt>' + escapeHtml(label) + ':</dt><dd>' + escapeHtml(value || 'Не указано') + '</dd></div>').join('') + '</dl></section>' +
+            '<section class="alert-detail-section alert-detail-request" aria-label="Данные заявки">' +
+            '<header class="alert-detail-section-heading"><h3><i data-lucide="clipboard-list"></i> Заявка</h3></header>' +
+            '<dl class="alert-detail-metadata">' + requestFields.map(([label, value]) => '<div><dt>' + escapeHtml(label) + ':</dt><dd>' + escapeHtml(value || 'Не указано') + '</dd></div>').join('') + '</dl>' +
+            stageControl + '</section></div>' +
+            '<div class="alert-detail-columns"><section class="alert-detail-section alert-detail-faults" data-tone="' + severityTone + '">' +
+                '<header class="alert-detail-section-heading"><h3><i data-lucide="triangle-alert"></i> Неисправности камеры</h3>' +
+                    '<span class="alert-detail-section-count">' + Math.max(1, alert.issues?.length || 0) + '</span></header>' +
+                '<div class="alert-detail-section-content">' + (alert.description ? renderAlertDetailText(alert.description, 'description') : '') +
+                    renderCameraCaseIssues(alert.issues, { alertId: id, canEdit: data.canEdit, legacyReport: alert.workReport,
+                        legacyAuthor: alert.assignedToDisplayName || alert.assignedToUsername || alert.resolvedByDisplayName || alert.resolvedByUsername,
+                        legacyCreatedAt: alert.updatedAt || alert.createdAt }) +
+                    (physical || alert.serviceNotified ? '<p class="alert-detail-service-note ' + (alert.serviceNotified ? 'notified' : 'pending') + '"><i data-lucide="' + (alert.serviceNotified ? 'circle-check' : 'phone') + '"></i>' +
+                        (alert.serviceNotified ? 'Профильная служба уведомлена' + (alert.serviceNotifiedAt ? ': ' + escapeHtml(date(alert.serviceNotifiedAt)) : '') : 'Профильная служба не уведомлена') + '</p>' : '') + '</div></section>' +
+            '<div class="alert-detail-side"><section class="alert-handoff-panel" data-alert-handoffs data-alert-id="' + id + '" data-can-create="' + (data.canCreateHandoff === true) + '"></section></div></div>' +
+            '<details class="error-audit-panel"' + (historyOpen ? ' open' : '') + ' data-alert-history="' + id + '" ontoggle="loadAlertHistory(this,' + id + ')">' +
+                '<summary><span><i data-lucide="history"></i> История изменений</span><i data-lucide="chevron-down" class="error-audit-chevron"></i></summary><div data-alert-history-list></div></details></details>';
+    }
+
+    function renderFullAlertActions(data) {
+        const id = Number(data.alert.id);
+        return (data.canAssignSelf ? '<button class="btn btn-secondary" type="button" onclick="takeError(' + id + ',this)"><i data-lucide="user-check"></i> Назначить себе</button>' : '') +
+            (data.canEdit ? '<button class="btn btn-primary" type="button" onclick="editOpenedAlert()"><i data-lucide="pencil"></i> Работа с заявкой</button>' : '') +
+            '<button class="btn btn-secondary" type="button" onclick="closeModal()">Закрыть</button>';
+    }
+
+    async function submitAlertIssueMessage(event, alertId, issueId) {
+        event.preventDefault();
+        const form = event.currentTarget;
+        const textarea = form.querySelector('textarea');
+        const button = form.querySelector('button[type="submit"]');
+        const message = textarea?.value.trim();
+        if (!message) return;
+        const details = document.getElementById('transferred-alert-details');
+        if (details) details.dataset.saving = 'true';
+        button.disabled = true;
+        try {
+            await apiPost('/api/alerts/' + alertId + '/issues/' + issueId + '/messages', { message });
+            textarea.value = '';
+            if (details) details.dataset.saving = 'false';
+            await openTransferredAlert(alertId, true);
+            showToast('Сообщение добавлено в отчёт', 'success');
+        } catch (error) {
+            if (details) details.dataset.saving = 'false';
+            button.disabled = false;
+            showToast(error.message, 'error');
+        }
+    }
+
+    async function openTransferredAlert(alertId, refresh = false) {
+        alertId = Number(alertId);
+        if (!Number.isSafeInteger(alertId) || alertId <= 0) return;
+        const modal = document.getElementById('modal-container');
+        let previous = document.getElementById('transferred-alert-details');
+        if (refresh && (modal.hidden || !previous || Number(previous.dataset.alertId) !== alertId ||
+            previous.dataset.loading === 'true' || previous.dataset.saving === 'true' ||
+            previous.querySelector('[data-preserve-on-refresh]:focus-within') ||
+            previous.querySelector('.alert-detail-stage-form')?.contains(document.activeElement))) return;
+        const historyOpen = refresh ? previous.querySelector('.error-audit-panel')?.open : false;
+        const expandedText = refresh ? [...previous.querySelectorAll('[data-detail-fold][open]')].map(item => item.dataset.detailFold) : [];
+        const scrollTop = refresh ? document.getElementById('modal-body').scrollTop : 0;
+        if (!refresh) {
+            showModal('Карточка ошибки', '<details open class="alert-detail-view" id="transferred-alert-details" data-alert-id="' + alertId + '"><summary>Загрузка карточки...</summary></details>',
+                '<button class="btn btn-secondary" type="button" onclick="closeModal()">Закрыть</button>');
+            previous = document.getElementById('transferred-alert-details');
+        }
+        previous.dataset.loading = 'true';
+        const request = ++alertDetailsRequest;
+        const isCurrent = () => request === alertDetailsRequest && !modal.hidden && previous === document.getElementById('transferred-alert-details');
+        try {
+            const data = await apiFetch('/api/alerts/' + alertId);
+            if (!isCurrent()) return;
+            const alert = data.alert;
+            previous.outerHTML = renderFullAlertDetails(data, historyOpen);
+            const modalHeader = renderAlertModalHeader(data);
+            const modalContext = document.getElementById('modal-context');
+            if (modalContext) {
+                modalContext.className = 'modal-context modal-camera-context';
+                modalContext.innerHTML = modalHeader.identityHtml;
+            }
+            const modalSubcontext = document.getElementById('modal-subcontext');
+            if (modalSubcontext) {
+                modalSubcontext.className = 'modal-subcontext modal-camera-location';
+                modalSubcontext.innerHTML = modalHeader.locationHtml;
+                modalSubcontext.hidden = false;
+            }
+            const modalTitleBadges = document.getElementById('modal-title-badges');
+            if (modalTitleBadges) {
+                modalTitleBadges.innerHTML = modalHeader.titleBadgesHtml;
+                modalTitleBadges.hidden = false;
+            }
+            const modalHeaderSeverity = document.getElementById('modal-header-severity');
+            if (modalHeaderSeverity) {
+                modalHeaderSeverity.innerHTML = modalHeader.severityHtml;
+                modalHeaderSeverity.hidden = false;
+            }
+            const modalSerial = document.getElementById('modal-alert-serial');
+            if (modalSerial) {
+                modalSerial.textContent = data.alertSerialNumber || ('SYS-' + alert.id);
+                modalSerial.hidden = false;
+            }
+            document.getElementById('modal-title').textContent = modalHeader.title;
+            document.getElementById('modal-footer').innerHTML = renderFullAlertActions(data);
+            const details = document.getElementById('transferred-alert-details');
+            details.querySelectorAll('[data-detail-fold]').forEach(item => { item.open = expandedText.includes(item.dataset.detailFold); });
+            details.alertData = data;
+            details.querySelector('.alert-detail-heading').onclick = event => event.preventDefault();
+            renderIcons();
+            if (!refresh) recordAlertViewed(details, alert.id);
+            if (historyOpen) {
+                const history = details.querySelector('.error-audit-panel');
+                await loadAlertHistory(history, alert.id);
+            }
+            await loadAlertHandoffs(details, alert.id, true);
+            if (!modal.hidden && details === document.getElementById('transferred-alert-details'))
+                document.getElementById('modal-body').scrollTop = scrollTop;
+        } catch (error) {
+            if (!isCurrent()) return;
+            if (!refresh || error.status === 401 || error.status === 403 || error.status === 404) {
+                previous.innerHTML = '<summary>Не удалось открыть карточку</summary><p>' + escapeHtml(error.message) + '</p>';
+                document.getElementById('modal-footer').innerHTML = '<button class="btn btn-secondary" type="button" onclick="closeModal()">Закрыть</button>';
+                previous.removeAttribute('id');
+            }
+            showToast(error.message, 'error');
+        } finally {
+            previous.dataset.loading = 'false';
+        }
+    }
+
+    function editOpenedAlert() {
+        const data = document.getElementById('transferred-alert-details')?.alertData;
+        if (!data?.canEdit) return;
+        const alert = data.alert;
+        openErrorEditor({ dataset: {
+            alertId: String(alert.id), alertTitle: alert.title,
+            category: alert.category === 1 || alert.category === 'Physical' ? 'Physical' : 'Technical',
+            assigneeId: String(alert.assignedToUserId || ''), workReport: alert.workReport || '',
+            serviceNotified: String(alert.serviceNotified), recovered: String(Boolean(alert.recoveryDetectedAt)), returnToCard: 'true'
+        }});
+    }
+
+    async function changeOpenedAlertStage(form) {
+        const details = form.closest('#transferred-alert-details');
+        if (!details?.alertData?.canEdit || details.dataset.saving === 'true') return;
+        const id = Number(details.dataset.alertId);
+        const stage = form.querySelector('select').value;
+        details.dataset.saving = 'true';
+        form.querySelectorAll('button, select').forEach(control => control.disabled = true);
+        try {
+            await apiFetch('/api/alerts/' + id + '/stage', { method: 'POST', body: { stage } });
+            showToast('Этап обработки ошибки изменён', 'success');
+            window.refreshVisibleData('saved', ['alerts', 'notifications', 'navigation']);
+        } catch (error) {
+            showToast(error.message, 'error');
+        } finally {
+            details.dataset.saving = 'false';
+            form.querySelectorAll('button, select').forEach(control => control.disabled = false);
+            if (form.contains(document.activeElement)) document.activeElement.blur();
+            await openTransferredAlert(id, true);
+        }
+    }
+
+    document.addEventListener('camera-maintainer:data-refresh', function (event) {
+        if (event.detail.topics.includes('settings')) {
+            alertHandoffReasonsPromise = null;
+            alertHandoffPreferencesPromise = null;
+        }
+        if (event.detail.topics.includes('alerts') || (event.detail.topics.includes('cameras') && document.querySelector('.history-folders, .history-folder-path')))
+            event.detail.waitUntil(refreshAlertBoard());
+    });
+
+    async function refreshAlertBoard() {
+        const response = await apiFetch(window.location.pathname + window.location.search);
+        const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+        if (!page.getElementById('alert-results')) return;
+        if (!window.canRefreshVisibleData()) {
+            window.refreshVisibleData('deferred', ['alerts']);
+            return;
+        }
+
+        const results = document.getElementById('alert-results');
+        const replacement = page.getElementById('alert-results');
+        const config = JSON.parse(page.getElementById('alert-board-live-data').textContent);
+        errorManagers.splice(0, errorManagers.length, ...config.managers);
+        // Column editor indexes refer to its own draft until it is closed.
+        if (!document.getElementById('board-column-title-0'))
+            alertBoardColumns.splice(0, alertBoardColumns.length, ...config.columns);
+        // Keep disclosure state, but use fresh authorized markup for its contents.
+        results.querySelectorAll('.error-crm-ticket, .error-item').forEach(card => {
+            const next = replacement.querySelector('[data-alert-id="' + card.dataset.alertId + '"]');
+            if (!next) return;
+            if (card.dataset.viewRecorded === 'true') next.dataset.viewRecorded = 'true';
+            if (card.matches('details')) next.open = card.open;
+            const details = next.querySelectorAll('details');
+            card.querySelectorAll('details').forEach((item, index) => {
+                if (details[index]) details[index].open = item.open;
+            });
+        });
+        const boardScroll = results.querySelector('.error-crm-board')?.scrollLeft || 0;
+        const scrollY = window.scrollY;
+        ['.queue-health', '.queue-summary', '.queue-toolbar', '#alert-results'].forEach(selector => {
+            const current = document.querySelector(selector);
+            const next = page.querySelector(selector);
+            if (current && next) current.replaceWith(next);
+        });
+        const board = document.querySelector('.error-crm-board');
+        if (board) board.scrollLeft = boardScroll;
+        window.scrollTo(window.scrollX, scrollY);
+        restoreAlertIssueSelections();
+        initAlertDragAndDrop();
+        renderIcons();
+        const tasks = [];
+        document.querySelectorAll('.error-crm-ticket[open]').forEach(card => tasks.push(loadAlertHandoffs(card, Number(card.dataset.alertId))));
+        results.querySelectorAll('.error-audit-panel[open]').forEach(panel => tasks.push(loadAlertHistory(panel, Number(panel.dataset.alertHistory))));
+        const transferred = document.getElementById('transferred-alert-details');
+        if (transferred) tasks.push(openTransferredAlert(Number(transferred.dataset.alertId), true));
+        await Promise.allSettled(tasks);
+    }
+
+    async function openAlertBoardSettings(refreshColumns = true) {
+        if (!errorCanManageUsers) return;
+        let handoffReasons = [];
+        try {
+            if (refreshColumns) {
+                const columns = await apiFetch('/api/alert-board/columns');
+                alertBoardColumns.splice(0, alertBoardColumns.length, ...columns);
+            }
+            handoffReasons = await getAlertHandoffReasons(true);
+        } catch (error) {
+            showToast(error.message, 'error');
+        }
+
+        const rows = alertBoardColumns.map(function (column, index) {
+            const deleteDisabled = ['new', 'assigned', 'working', 'review', 'ready'].includes(column.key)
+                ? ' disabled title="Системный этап: доступно переименование и настройка"' : '';
+            const moveUpDisabled = index === 0 || alertBoardReorderPending ? ' disabled' : '';
+            const moveDownDisabled = index === alertBoardColumns.length - 1 || alertBoardReorderPending ? ' disabled' : '';
+            return '<div class="board-column-setting" data-board-column-index="' + index + '">' +
+                '<div class="board-column-setting-fields">' +
+                    '<label>Название<input id="board-column-title-' + index + '" value="' + escapeHtml(column.title) + '" maxlength="64"></label>' +
+                    '<label>Подпись<input id="board-column-subtitle-' + index + '" value="' + escapeHtml(column.subtitle || '') + '" maxlength="128"></label>' +
+                    '<label class="board-column-color">Цвет<input id="board-column-color-' + index + '" type="color" value="' + escapeHtml(column.color) + '"></label>' +
+                '</div>' +
+                renderAlertBoardRoleSelector(String(index), column.visibleToRoles) +
+                '<div class="board-column-setting-actions">' +
+                    '<button class="btn btn-sm" type="button" onclick="moveAlertBoardColumn(' + index + ', -1)" title="Выше" aria-label="Переместить выше"' + moveUpDisabled + '><i data-lucide="arrow-up"></i></button>' +
+                    '<button class="btn btn-sm" type="button" onclick="moveAlertBoardColumn(' + index + ', 1)" title="Ниже" aria-label="Переместить ниже"' + moveDownDisabled + '><i data-lucide="arrow-down"></i></button>' +
+                    '<button class="btn btn-sm btn-primary" type="button" onclick="saveAlertBoardColumn(' + index + ')"><i data-lucide="save"></i> Сохранить</button>' +
+                    '<button class="btn btn-sm btn-danger" type="button" onclick="deleteAlertBoardColumn(' + index + ')"' + deleteDisabled + '><i data-lucide="trash-2"></i> Удалить</button>' +
+                '</div>' +
+            '</div>';
+        }).join('');
+
+        const body = '<div class="board-column-settings-list">' + rows + '</div>' +
+            '<div class="board-column-add">' +
+                '<strong>Новая колонка</strong>' +
+                '<div class="board-column-setting-fields">' +
+                    '<label>Название<input id="board-new-column-title" maxlength="64" placeholder="Например: Ожидает сервис"></label>' +
+                    '<label>Подпись<input id="board-new-column-subtitle" maxlength="128" placeholder="Краткое описание этапа"></label>' +
+                    '<label class="board-column-color">Цвет<input id="board-new-column-color" type="color" value="#35c7bd"></label>' +
+                '</div>' +
+                renderAlertBoardRoleSelector('new', ['Admin', 'Operator', 'Technician']) +
+            '</div>' + renderAlertHandoffReasonSettings(handoffReasons);
+
+        showModal(
+            'Настройка колонок ошибок',
+            body,
+            '<button class="btn btn-secondary" type="button" onclick="closeModal()">Закрыть</button>' +
+            '<button class="btn btn-secondary" type="button" onclick="applyRecommendedAlertWorkflow()"><i data-lucide="workflow"></i> Рекомендуемый процесс</button>' +
+            '<button class="btn btn-primary" type="button" onclick="addAlertBoardColumn()"><i data-lucide="plus"></i> Добавить колонку</button>'
+        );
+    }
+
+    function renderAlertHandoffReasonSettings(reasons) {
+        const rows = (Array.isArray(reasons) ? reasons : []).map(function (reason) {
+            return '<div class="handoff-reason-setting">' +
+                '<input class="form-input" id="handoff-reason-name-' + reason.id + '" value="' + escapeHtml(reason.name) + '" maxlength="128">' +
+                '<label class="settings-toggle compact"><input id="handoff-reason-active-' + reason.id + '" type="checkbox"' + (reason.isActive ? ' checked' : '') + '><span class="toggle-track"></span><span>Активен</span></label>' +
+                '<button class="btn btn-sm btn-secondary" type="button" onclick="saveAlertHandoffReason(' + reason.id + ')"><i data-lucide="save"></i> Сохранить</button>' +
+            '</div>';
+        }).join('');
+        return '<section class="handoff-reason-settings"><header><span><strong>Внутренние статусы передачи</strong><small>Причины и состояния внутри карточки, без создания новых колонок</small></span><i data-lucide="git-pull-request-arrow"></i></header>' +
+            '<div class="handoff-reason-settings-list">' + rows + '</div>' +
+            '<div class="handoff-reason-add"><input class="form-input" id="handoff-reason-new-name" maxlength="128" placeholder="Например: Ожидание поставки"><button class="btn btn-primary" type="button" onclick="saveAlertHandoffReason()"><i data-lucide="plus"></i> Добавить</button></div>' +
+        '</section>';
+    }
+
+    async function saveAlertHandoffReason(reasonId) {
+        const nameInput = document.getElementById(reasonId ? 'handoff-reason-name-' + reasonId : 'handoff-reason-new-name');
+        const activeInput = reasonId ? document.getElementById('handoff-reason-active-' + reasonId) : null;
+        const name = nameInput ? nameInput.value.trim() : '';
+        if (!name) {
+            showToast('Введите название внутреннего статуса', 'warning');
+            return;
+        }
+        try {
+            const url = reasonId ? '/api/alerts/handoff-reasons/' + reasonId : '/api/alerts/handoff-reasons';
+            await apiFetch(url, {
+                method: reasonId ? 'PUT' : 'POST',
+                body: { name: name, isActive: activeInput ? activeInput.checked : true }
+            });
+            alertHandoffReasonsPromise = null;
+            showToast(reasonId ? 'Внутренний статус сохранён' : 'Внутренний статус добавлен', 'success');
+            await openAlertBoardSettings();
+        } catch (error) {
+            showToast(error.message, 'error');
+        }
+    }
+
+    function renderAlertBoardRoleSelector(group, selectedRoles) {
+        const selected = new Set(Array.isArray(selectedRoles) ? selectedRoles : alertBoardRoles.map(function (role) { return role.key; }));
+        selected.add('Admin');
+        return '<fieldset class="board-column-role-fieldset" data-board-role-group="' + escapeHtml(group) + '">' +
+            '<legend>Показывать для типов аккаунтов</legend>' +
+            '<div class="board-column-role-options">' + alertBoardRoles.map(function (role) {
+                const checked = selected.has(role.key) ? ' checked' : '';
+                const locked = role.key === 'Admin' ? ' disabled' : '';
+                const hint = role.key === 'Admin' ? '<small>Всегда доступно</small>' : '';
+                return '<label class="board-column-role-option">' +
+                    '<input type="checkbox" value="' + role.key + '"' + checked + locked + '>' +
+                    '<span><b>' + role.label + '</b>' + hint + '</span>' +
+                '</label>';
+            }).join('') + '</div>' +
+        '</fieldset>';
+    }
+
+    function getAlertBoardSelectedRoles(group) {
+        const fieldset = document.querySelector('[data-board-role-group="' + group + '"]');
+        const selected = fieldset
+            ? Array.from(fieldset.querySelectorAll('input[type="checkbox"]:checked')).map(function (input) { return input.value; })
+            : [];
+        if (!selected.includes('Admin')) selected.unshift('Admin');
+        return selected;
+    }
+
+    async function applyRecommendedAlertWorkflow() {
+        try {
+            await apiFetch('/api/alert-board/columns/recommended', { method: 'POST' });
+            closeModal();
+            showToast('Рабочий процесс из шести этапов применён', 'success');
+            window.refreshVisibleData('saved', ['alerts', 'notifications', 'navigation']);
+        } catch (error) {
+            showToast(error.message, 'error');
+        }
+    }
+
+    async function saveAlertBoardColumn(index) {
+        const column = alertBoardColumns[index];
+        if (!column) return;
+        try {
+            await apiFetch('/api/alert-board/columns/' + encodeURIComponent(column.key), {
+                method: 'PUT',
+                body: {
+                    title: document.getElementById('board-column-title-' + index).value.trim(),
+                    subtitle: document.getElementById('board-column-subtitle-' + index).value.trim(),
+                    color: document.getElementById('board-column-color-' + index).value,
+                    visibleToRoles: getAlertBoardSelectedRoles(String(index))
+                }
+            });
+            showToast('Колонка сохранена', 'success');
+            closeModal();
+            window.refreshVisibleData('saved', ['alerts', 'navigation']);
+        } catch (error) { showToast(error.message, 'error'); }
+    }
+
+    async function addAlertBoardColumn() {
+        const title = document.getElementById('board-new-column-title').value.trim();
+        const subtitle = document.getElementById('board-new-column-subtitle').value.trim();
+        const color = document.getElementById('board-new-column-color').value;
+        const visibleToRoles = getAlertBoardSelectedRoles('new');
+        if (!title) { showToast('Введите название новой колонки', 'warning'); return; }
+        try {
+            await apiFetch('/api/alert-board/columns', { method: 'POST', body: { title, subtitle, color, visibleToRoles } });
+            showToast('Колонка добавлена', 'success');
+            closeModal();
+            window.refreshVisibleData('saved', ['alerts', 'navigation']);
+        } catch (error) { showToast(error.message, 'error'); }
+    }
+
+    function captureAlertBoardColumnDrafts() {
+        alertBoardColumns.forEach(function (column, index) {
+            const title = document.getElementById('board-column-title-' + index);
+            const subtitle = document.getElementById('board-column-subtitle-' + index);
+            const color = document.getElementById('board-column-color-' + index);
+            if (title) column.title = title.value;
+            if (subtitle) column.subtitle = subtitle.value;
+            if (color) column.color = color.value;
+            column.visibleToRoles = getAlertBoardSelectedRoles(String(index));
+        });
+    }
+
+    function syncAlertBoardColumnOrder() {
+        const board = document.querySelector('.error-crm-board');
+        if (!board) return;
+        const stages = Array.from(board.querySelectorAll('[data-alert-stage]'));
+        alertBoardColumns.forEach(function (column) {
+            const stage = stages.find(function (item) { return item.dataset.alertStage === column.key; });
+            if (stage) board.appendChild(stage);
+        });
+    }
+
+    async function moveAlertBoardColumn(index, direction) {
+        if (alertBoardReorderPending) return;
+        const target = index + direction;
+        if (target < 0 || target >= alertBoardColumns.length) return;
+
+        captureAlertBoardColumnDrafts();
+        const originalOrder = alertBoardColumns.slice();
+        const movedColumn = alertBoardColumns.splice(index, 1)[0];
+        alertBoardColumns.splice(target, 0, movedColumn);
+        const keys = alertBoardColumns.map(function (column) { return column.key; });
+        alertBoardReorderPending = true;
+        syncAlertBoardColumnOrder();
+        openAlertBoardSettings(false);
+
+        try {
+            await apiFetch('/api/alert-board/columns/reorder', { method: 'PUT', body: { keys } });
+            showToast('Порядок колонок сохранён', 'success');
+        } catch (error) {
+            alertBoardColumns.splice(0, alertBoardColumns.length, ...originalOrder);
+            syncAlertBoardColumnOrder();
+            showToast(error.message, 'error');
+        } finally {
+            alertBoardReorderPending = false;
+            const modal = document.getElementById('modal-container');
+            if (modal && !modal.hidden) openAlertBoardSettings(false);
+        }
+    }
+
+    function deleteAlertBoardColumn(index) {
+        const column = alertBoardColumns[index];
+        if (!column || alertBoardColumns.length <= 1) {
+            showToast('Нельзя удалить последнюю колонку', 'warning');
+            return;
+        }
+
+        const options = alertBoardColumns
+            .filter(function (item) { return item.key !== column.key; })
+            .map(function (item) { return '<option value="' + escapeHtml(item.key) + '">' + escapeHtml(item.title) + '</option>'; })
+            .join('');
+        showModal(
+            'Удалить колонку',
+            '<p class="modal-message">Карточки из «' + escapeHtml(column.title) + '» будут перенесены в выбранную колонку.</p>' +
+                '<label class="form-label" for="board-delete-target">Перенести карточки в</label>' +
+                '<select class="form-select" id="board-delete-target">' + options + '</select>',
+            '<button class="btn btn-secondary" type="button" onclick="closeModal()">Отмена</button>' +
+                '<button class="btn btn-danger" type="button" id="board-delete-confirm">Удалить</button>'
+        );
+        document.getElementById('board-delete-confirm').onclick = async function () {
+            const moveTo = document.getElementById('board-delete-target').value;
+            this.disabled = true;
+            try {
+                await apiFetch('/api/alert-board/columns/' + encodeURIComponent(column.key), {
+                    method: 'DELETE',
+                    body: { moveTo }
+                });
+                closeModal();
+                showToast('Колонка удалена, карточки перенесены', 'success');
+                window.refreshVisibleData('saved', ['alerts', 'notifications', 'navigation']);
+            } catch (error) {
+                this.disabled = false;
+                showToast(error.message, 'error');
+            }
+        };
+    }
+
+    async function takeError(id, button) {
+        const originalText = button.textContent;
+        button.disabled = true;
+        button.textContent = 'Назначение...';
+        try {
+            await apiPost('/api/alerts/' + id + '/assign', {});
+            showToast('Ошибка назначена вам', 'success');
+            window.refreshVisibleData('saved', ['alerts', 'notifications', 'navigation']);
+        } catch (error) {
+            showToast(error.message, 'error');
+            button.disabled = false;
+            button.textContent = originalText;
+        }
+    }
+
+    let draggedAlertId = 0;
+    let draggedAlertStage = '';
+    let alertInteractionsInitialized = false;
+    const movingAlertIds = new Set();
+    const selectedAlertIssueIds = new Map();
+
+    function closeAlertIssueMenus(exceptPicker) {
+        document.querySelectorAll('.error-crm-issue-picker.is-open').forEach(function (picker) {
+            if (picker === exceptPicker) return;
+            picker.classList.remove('is-open');
+            const summary = picker.closest('.error-crm-ticket-summary');
+            const menu = summary?.querySelector('.error-crm-issue-menu');
+            const button = picker.querySelector('.error-crm-summary-count');
+            if (menu) menu.hidden = true;
+            if (button) button.setAttribute('aria-expanded', 'false');
+        });
+    }
+
+    function applyAlertIssueSelection(card, option, remember = true) {
+        if (!card || !option) return;
+        const title = option.dataset.issueTitle || option.querySelector('strong')?.textContent || '';
+        const titleTarget = card.querySelector('.error-crm-summary-error-title > span');
+        if (titleTarget) titleTarget.textContent = title;
+        const countButton = card.querySelector('.error-crm-summary-count');
+        const positionTarget = countButton?.querySelector('.error-crm-summary-position');
+        const total = Number(countButton?.dataset.issueTotal) || card.querySelectorAll('.error-crm-issue-option').length || 1;
+        const position = Number(option.dataset.issuePosition) || 1;
+        if (positionTarget) positionTarget.textContent = `${position} из ${total}`;
+        const category = option.dataset.issueCategory === 'physical' ? 'physical' : 'technical';
+        const categoryLabel = option.dataset.issueCategoryLabel || (category === 'physical' ? 'Физическая' : 'Техническая');
+        const categoryBadge = card.querySelector('.error-crm-summary-type');
+        if (categoryBadge) {
+            categoryBadge.textContent = categoryLabel;
+            categoryBadge.classList.toggle('physical', category === 'physical');
+            categoryBadge.classList.toggle('technical', category === 'technical');
+        }
+        card.classList.toggle('physical', category === 'physical');
+        card.classList.toggle('technical', category === 'technical');
+        card.querySelectorAll('.error-crm-issue-option').forEach(function (item) {
+            const selected = item === option;
+            item.classList.toggle('is-selected', selected);
+            item.setAttribute('aria-selected', String(selected));
+        });
+        if (remember)
+            selectedAlertIssueIds.set(Number(card.dataset.alertId), String(option.dataset.issueId));
+    }
+
+    function restoreAlertIssueSelections() {
+        document.querySelectorAll('.error-crm-ticket[data-alert-id]').forEach(function (card) {
+            const alertId = Number(card.dataset.alertId);
+            const selectedId = selectedAlertIssueIds.get(alertId);
+            if (!selectedId) return;
+            const option = Array.from(card.querySelectorAll('.error-crm-issue-option'))
+                .find(item => String(item.dataset.issueId) === selectedId);
+            if (option) applyAlertIssueSelection(card, option, false);
+            else selectedAlertIssueIds.delete(alertId);
+        });
+    }
+
+    function toggleAlertIssueMenu(event, button) {
+        event.preventDefault();
+        event.stopPropagation();
+        const picker = button.closest('.error-crm-issue-picker');
+        const summary = picker?.closest('.error-crm-ticket-summary');
+        const menu = summary?.querySelector('.error-crm-issue-menu');
+        if (!picker || !menu) return;
+        const open = menu.hidden;
+        closeAlertIssueMenus(open ? picker : null);
+        picker.classList.toggle('is-open', open);
+        menu.hidden = !open;
+        button.setAttribute('aria-expanded', String(open));
+    }
+
+    function selectAlertIssue(event, option) {
+        event.preventDefault();
+        event.stopPropagation();
+        const card = option.closest('.error-crm-ticket');
+        applyAlertIssueSelection(card, option);
+        closeAlertIssueMenus();
+    }
+
+    function initAlertDragAndDrop() {
+        if (alertInteractionsInitialized) return;
+        alertInteractionsInitialized = true;
+        // Delegation keeps these handlers alive when SignalR replaces the board.
+        document.addEventListener('click', function (event) {
+            if (!event.target.closest('.error-crm-issue-picker, .error-crm-issue-menu')) closeAlertIssueMenus();
+            const summary = event.target.closest('.error-crm-ticket-summary');
+            if (!summary) return;
+            const openButton = event.target.closest('.error-crm-summary-chevron');
+            event.preventDefault();
+            if (!event.isTrusted) return;
+            if (openButton || event.detail === 0) {
+                openTransferredAlert(Number(summary.closest('.error-crm-ticket').dataset.alertId));
+            }
+        });
+        document.addEventListener('keydown', function (event) {
+            if (event.key === 'Escape') closeAlertIssueMenus();
+        });
+        document.addEventListener('dblclick', function (event) {
+            const card = event.target.closest('.error-crm-ticket, .error-item');
+            if (!card || event.target.closest('button, a, input, select, textarea, .error-audit-panel, .alert-handoff-panel') ||
+                document.body.classList.contains('alert-dragging')) return;
+            event.preventDefault();
+            if (movingAlertIds.has(Number(card.dataset.alertId))) return;
+            openTransferredAlert(Number(card.dataset.alertId));
+            window.getSelection()?.removeAllRanges();
+        });
+        document.addEventListener('dragstart', function (event) {
+            const card = event.target.closest('.error-crm-ticket');
+            if (!card) return;
+            if (card.draggable !== true || movingAlertIds.size || event.target.closest('button, a, input, select, textarea')) {
+                event.preventDefault();
+                return;
+            }
+            draggedAlertId = Number(card.dataset.alertId);
+            draggedAlertStage = card.dataset.alertStage || '';
+            card.classList.add('dragging');
+            document.body.classList.add('alert-dragging');
+            card.setAttribute('aria-grabbed', 'true');
+            event.dataTransfer.effectAllowed = 'move';
+            event.dataTransfer.setData('text/plain', String(draggedAlertId));
+        });
+        document.addEventListener('dragend', clearAlertDrag);
+        document.addEventListener('dragover', function (event) {
+            const column = event.target.closest('.error-crm-stage[data-alert-stage]');
+            if (!column || !draggedAlertId || movingAlertIds.size) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = 'move';
+            column.classList.add('drag-over');
+        });
+        document.addEventListener('dragleave', function (event) {
+            const column = event.target.closest('.error-crm-stage[data-alert-stage]');
+            if (column && !column.contains(event.relatedTarget)) column.classList.remove('drag-over');
+        });
+        document.addEventListener('drop', async function (event) {
+            const column = event.target.closest('.error-crm-stage[data-alert-stage]');
+            if (!column || !draggedAlertId) return;
+            event.preventDefault();
+            const id = draggedAlertId;
+            const stage = column.dataset.alertStage;
+            const originalStage = draggedAlertStage;
+            clearAlertDrag();
+            if (!stage || stage === originalStage || movingAlertIds.has(id)) return;
+            const card = document.querySelector('.error-crm-ticket[data-alert-id="' + id + '"]');
+            movingAlertIds.add(id);
+            document.body.classList.add('alert-moving');
+            card?.setAttribute('aria-busy', 'true');
+            try {
+                await apiFetch('/api/alerts/' + id + '/stage', { method: 'POST', body: { stage } });
+                if (card) {
+                    const previousColumn = card.closest('.error-crm-stage');
+                    column.querySelector('.error-crm-stage-empty')?.remove();
+                    column.querySelector('[data-alert-drop-stage]').appendChild(card);
+                    card.dataset.alertStage = stage;
+                    card.style.setProperty('--error-stage-color', stage === 'new'
+                        ? 'var(--' + (card.classList.contains('critical') ? 'danger' : 'warning') + ')'
+                        : column.style.getPropertyValue('--stage-color'));
+                    [previousColumn, column].forEach(function (item) {
+                        item.classList.toggle('is-empty', !item.querySelector('.error-crm-ticket'));
+                        const counter = item.querySelector('.error-crm-stage-header > b');
+                        counter.textContent = String(Math.max(0, Number(counter.textContent) + (item === column ? 1 : -1)));
+                    });
+                }
+                showToast('Этап обработки ошибки изменён', 'success');
+            } catch (error) {
+                showToast(error.message, 'error');
+            } finally {
+                movingAlertIds.delete(id);
+                card?.removeAttribute('aria-busy');
+                document.body.classList.remove('alert-moving');
+                try { await refreshAlertBoard(); } catch (_) { window.refreshVisibleData('retry', ['alerts', 'navigation']); }
+            }
+        });
+    }
+
+    function clearAlertDrag() {
+        document.querySelectorAll('.error-crm-ticket.dragging').forEach(function (card) {
+            card.classList.remove('dragging');
+            card.removeAttribute('aria-grabbed');
+        });
+        document.querySelectorAll('.error-crm-stage.drag-over').forEach(item => item.classList.remove('drag-over'));
+        document.body.classList.remove('alert-dragging');
+        draggedAlertId = 0;
+        draggedAlertStage = '';
+    }
+
+    function openErrorEditor(button) {
+        const data = button.dataset;
+        const selectedAssignee = Number(data.assigneeId || 0);
+        const managerField = errorCanManageUsers
+            ? '<div class="form-group"><label class="form-label" for="error-assignee">Ответственный менеджер</label>'
+                + '<select id="error-assignee" class="form-select">'
+                + '<option value="">Назначить себя</option>'
+                + errorManagers.map(function (manager) {
+                    const selected = manager.id === selectedAssignee ? ' selected' : '';
+                    return '<option value="' + manager.id + '"' + selected + '>'
+                        + escapeHtml(manager.displayName || manager.username) + ' · ' + escapeHtml(manager.username)
+                        + '</option>';
+                }).join('')
+                + '</select></div>'
+            : '';
+
+        const body = '<form id="error-work-form" class="error-work-form" data-alert-id="' + data.alertId
+            + '" data-assignee-id="' + (data.assigneeId || '') + '" data-recovered="' + (data.recovered === 'true') + '" data-return-to-card="' + (data.returnToCard === 'true') + '">'
+            + '<div class="error-editor-summary"><span>Ошибка #' + data.alertId + '</span><strong>'
+            + escapeHtml(data.alertTitle) + '</strong></div>'
+            + '<div class="form-group"><span class="form-label">Тип неисправности</span>'
+            + '<div class="error-category-choices">'
+            + categoryChoice('Technical', 'Техническая', data.category === 'Technical')
+            + categoryChoice('Physical', 'Физическая', data.category === 'Physical')
+            + '</div></div>'
+            + managerField
+            + '<div class="form-group"><label class="form-label" for="error-work-report">Как проведена работа</label>'
+            + '<textarea id="error-work-report" rows="6" maxlength="4000" placeholder="Опишите диагностику, выполненные действия и результат">'
+            + escapeHtml(data.workReport || '') + '</textarea>'
+            + '<span class="form-help">Отчёт обязателен при закрытии ошибки.</span></div>'
+            + '<label class="error-service-check" id="error-service-group">'
+            + '<input type="checkbox" id="error-service-notified"'
+            + (data.serviceNotified === 'true' ? ' checked' : '') + '>'
+            + '<span class="toggle-track"></span>'
+            + '<span><strong>Профильная служба уведомлена</strong><small>'
+            + (data.recovered === 'true' ? 'Восстановление подтверждено проверкой' : 'Обязательно для физической неисправности') + '</small></span>'
+            + '</label>'
+            + '<div class="error-editor-status" id="error-editor-status"></div>'
+            + '</form>';
+
+        showModal(
+            'Работа с ошибкой',
+            body,
+            '<button class="btn btn-secondary" type="button" onclick="' + (data.returnToCard === 'true' ? 'openTransferredAlert(' + Number(data.alertId) + ')' : 'closeModal()') + '">Отмена</button>'
+                + '<button class="btn btn-secondary" type="button" id="error-save-button" onclick="saveErrorWork(false)">Сохранить</button>'
+                + (errorCanReview ? '<button class="btn btn-primary" type="button" id="error-resolve-button" onclick="saveErrorWork(true)">Сохранить и закрыть</button>' : '')
+        );
+
+        document.querySelectorAll('input[name="error-category"]').forEach(function (radio) {
+            radio.addEventListener('change', updateServiceVisibility);
+        });
+        updateServiceVisibility();
+    }
+
+    function categoryChoice(value, label, checked) {
+        return '<label><input type="radio" name="error-category" value="' + value + '"'
+            + (checked ? ' checked' : '') + '><span>' + label + '</span></label>';
+    }
+
+    function updateServiceVisibility() {
+        const category = document.querySelector('input[name="error-category"]:checked')?.value;
+        const group = document.getElementById('error-service-group');
+        if (group) group.hidden = category !== 'Physical';
+    }
+
+    async function saveErrorWork(resolveAfterSave) {
+        const form = document.getElementById('error-work-form');
+        if (!form) return;
+
+        const id = Number(form.dataset.alertId);
+        const category = document.querySelector('input[name="error-category"]:checked')?.value || 'Technical';
+        const workReport = document.getElementById('error-work-report').value.trim();
+        const serviceNotified = category === 'Physical'
+            && document.getElementById('error-service-notified').checked;
+        const status = document.getElementById('error-editor-status');
+        const buttons = [
+            document.getElementById('error-save-button'),
+            document.getElementById('error-resolve-button')
+        ];
+
+        if (resolveAfterSave && !workReport) {
+            status.textContent = 'Для закрытия заполните отчёт о работе.';
+            status.className = 'error-editor-status error';
+            return;
+        }
+        if (resolveAfterSave && category === 'Physical' && !serviceNotified && form.dataset.recovered !== 'true') {
+            status.textContent = 'Отметьте, что профильная служба уведомлена.';
+            status.className = 'error-editor-status error';
+            return;
+        }
+
+        buttons.forEach(function (item) { if (item) item.disabled = true; });
+        status.textContent = resolveAfterSave ? 'Сохранение и закрытие...' : 'Сохранение...';
+        status.className = 'error-editor-status';
+
+        try {
+            const assigneeSelect = document.getElementById('error-assignee');
+            const existingAssignee = Number(form.dataset.assigneeId || 0);
+            if (assigneeSelect && Number(assigneeSelect.value || 0) !== existingAssignee) {
+                await apiPost('/api/alerts/' + id + '/assign', {
+                    userId: Number(assigneeSelect.value || errorCurrentUserId)
+                });
+            } else if (!existingAssignee) {
+                await apiPost('/api/alerts/' + id + '/assign', {});
+            }
+
+            await apiFetch('/api/alerts/' + id + '/work', {
+                method: 'PUT',
+                body: {
+                    category: category,
+                    workReport: workReport,
+                    serviceNotified: serviceNotified
+                }
+            });
+
+            if (resolveAfterSave) {
+                await apiPost('/api/alerts/' + id + '/stage', { stage: 'ready' });
+                await apiPost('/api/alerts/' + id + '/resolve', {});
+            }
+
+            showToast(resolveAfterSave ? 'Ошибка закрыта и добавлена в историю' : 'Карточка ошибки сохранена', 'success');
+            closeModal({ notify: form.dataset.returnToCard !== 'true' });
+            window.refreshVisibleData('saved', ['alerts', 'notifications', 'navigation']);
+            if (form.dataset.returnToCard === 'true') await openTransferredAlert(id);
+        } catch (error) {
+            status.textContent = error.message;
+            status.className = 'error-editor-status error';
+            buttons.forEach(function (item) { if (item) item.disabled = false; });
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', function () {
+        initAlertDragAndDrop();
+        restoreAlertIssueSelections();
+        const requestedAlertId = Number(new URLSearchParams(window.location.search).get('alert') || 0);
+        if (!requestedAlertId) return;
+        if (new URLSearchParams(window.location.search).get('fromCameraHistory') === '1') {
+            try {
+                const context = JSON.parse(sessionStorage.getItem('camera-maintainer:history-return') || 'null');
+                const returnUrl = context && new URL(context.url, location.origin);
+                if (context?.alertId === requestedAlertId && returnUrl.origin === location.origin && returnUrl.pathname === '/Cameras') {
+                    document.addEventListener('camera-maintainer:modal-closed', function () {
+                        returnUrl.searchParams.set('restoreCameraHistory', '1');
+                        location.replace(returnUrl.pathname + returnUrl.search);
+                    }, { once: true });
+                }
+            } catch { }
+        } else {
+            // Открыто по внешней ссылке: после закрытия убираем параметр из адреса,
+            // иначе обычное обновление страницы снова открывает эту карточку.
+            document.addEventListener('camera-maintainer:modal-closed', function () {
+                const url = new URL(window.location.href);
+                if (!url.searchParams.has('alert')) return;
+                url.searchParams.delete('alert');
+                history.replaceState(null, '', url.pathname + url.search + url.hash);
+            }, { once: true });
+        }
+        openTransferredAlert(requestedAlertId);
+    });
+</script>
+
+@functions {
+    private static string EffectiveWorkflowStage(Alert alert)
+    {
+        return AlertVisibilityPolicy.EffectiveStage(alert);
+    }
+
+    private static string Tashkent(DateTime value)
+    {
+        var utc = value.Kind == DateTimeKind.Utc
+            ? value
+            : DateTime.SpecifyKind(value, DateTimeKind.Utc);
+        var timeZoneId = TimeZoneInfo.GetSystemTimeZones().Any(zone => zone.Id == "Asia/Tashkent")
+            ? "Asia/Tashkent"
+            : "West Asia Standard Time";
+        return TimeZoneInfo.ConvertTimeFromUtc(utc, TimeZoneInfo.FindSystemTimeZoneById(timeZoneId))
+            .ToString("dd.MM.yyyy HH:mm");
+    }
+
+    private static string CountLabel(int count)
+    {
+        var remainder100 = count % 100;
+        var remainder10 = count % 10;
+        if (remainder100 is >= 11 and <= 14)
+            return "ошибок";
+        return remainder10 switch
+        {
+            1 => "ошибка",
+            >= 2 and <= 4 => "ошибки",
+            _ => "ошибок"
+        };
+    }
+
+    private static string RoleVisibilityText(IEnumerable<string> roles)
+    {
+        var labels = roles.Select(role => role switch
+        {
+            "Admin" => "Администратор",
+            "Operator" => "Оператор",
+            "Technician" => "Техник",
+            "Viewer" => "Наблюдатель",
+            _ => role
+        });
+        return "Доступ: " + string.Join(", ", labels);
+    }
+
+    private static string Initials(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "?";
+
+        var parts = value.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return string.Concat(parts.Take(2).Select(part => char.ToUpperInvariant(part[0])));
+    }
+
+    private static string LocalizedAlertTitle(AlertType type, string? source, string? description)
+        => CameraErrorMessages.Title(type, source, description);
+
+    private static string LocalizedAlertDescription(AlertType type, string? source)
+    {
+        var translated = CameraErrorMessages.Translate(source);
+        if (!string.IsNullOrWhiteSpace(source) && !string.Equals(translated, source, StringComparison.Ordinal))
+            return translated;
+
+        if (HasCyrillic(source))
+            return source!;
+
+        return type switch
+        {
+            AlertType.CameraOffline => "Камера не отвечает на проверку доступности.",
+            AlertType.TemperatureHigh => "Температура камеры превышает допустимое значение.",
+            AlertType.FirmwareOutdated => "Для камеры доступна более новая версия прошивки.",
+            AlertType.AuthenticationFailed => "Проверьте имя пользователя и пароль ONVIF.",
+            AlertType.ConfigurationChanged => "Проверьте настройки и время камеры.",
+            AlertType.AutoRecoveryFailed => "Требуется ручная проверка камеры.",
+            AlertType.LensObstructed => "Объектив закрыт, перекрыт или камера направлена неверно.",
+            _ => "Требуется проверка камеры."
+        };
+    }
+
+    private static bool HasCyrillic(string? value) =>
+        !string.IsNullOrWhiteSpace(value) && value.Any(character => character is >= '\u0400' and <= '\u04FF');
+}

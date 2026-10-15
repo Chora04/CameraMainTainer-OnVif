@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CameraMaintainer.Core/CameraMaintainer.Core.csproj" />
+    <Project Path="src/CameraMaintainer.Infrastructure/CameraMaintainer.Infrastructure.csproj" />
+    <Project Path="src/CameraMaintainer.Onvif/CameraMaintainer.Onvif.csproj" />
+    <Project Path="src/CameraMaintainer.Services/CameraMaintainer.Services.csproj" />
+    <Project Path="src/CameraMaintainer.Web/CameraMaintainer.Web.csproj" />
+    <Project Path="src/CameraMaintainer.Workers/CameraMaintainer.Workers.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CameraMaintainer.Tests/CameraMaintainer.Tests.csproj" />
+  </Folder>
+</Solution>

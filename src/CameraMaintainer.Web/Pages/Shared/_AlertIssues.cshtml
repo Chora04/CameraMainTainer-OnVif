@@ -1,0 +1,36 @@
+@model CameraMaintainer.Core.Models.Alert
+@using CameraMaintainer.Core.Enums
+@if (Model.Issues.Count > 0)
+{
+    <ul class="alert-issue-list" aria-label="Ошибки в заявке">
+    @foreach (var issue in Model.Issues.OrderBy(item => item.RecoveredAt.HasValue).ThenBy(item => item.StartedAt))
+    {
+        var title = issue.Title.Any(character => character is >= '\u0400' and <= '\u04FF') ? issue.Title : issue.AlertType switch
+        {
+            AlertType.CameraOffline => "Камера недоступна",
+            AlertType.TemperatureHigh => "Повышенная температура камеры",
+            AlertType.FirmwareOutdated => "Требуется обновление прошивки",
+            AlertType.AuthenticationFailed => "Ошибка авторизации камеры",
+            AlertType.ConfigurationChanged => "Изменились настройки камеры",
+            AlertType.AutoRecoveryFailed => "Автоматическое восстановление не выполнено",
+            AlertType.LensObstructed => "Проблема с объективом камеры",
+            _ => issue.Title
+        };
+        <li class="@(issue.RecoveredAt.HasValue ? "recovered" : "")">
+            <div class="alert-issue-title"><strong>@title</strong><span>@(issue.Category == ErrorCategory.Physical ? "Физическая" : "Техническая")</span></div>
+            <dl class="alert-issue-lifecycle">
+                <div><dt>Начало:</dt><dd>@Date(issue.StartedAt)</dd></div>
+                <div><dt>Конец:</dt><dd class="@(issue.RecoveredAt.HasValue ? "metric-ok" : "")">@(issue.RecoveredAt.HasValue ? Date(issue.RecoveredAt.Value) : "Ошибка активна")</dd></div>
+                <div><dt>Исправил:</dt><dd>@(issue.ResolvedByDisplayName ?? issue.ResolvedByUsername ?? "Не указано")</dd></div>
+            </dl>
+            @if (!string.IsNullOrWhiteSpace(issue.Description))
+            {
+                <p>@CameraErrorMessages.Translate(issue.Description)</p>
+            }
+        </li>
+    }
+    </ul>
+}
+@functions {
+    private static string Date(DateTime value) => DateTime.SpecifyKind(value, DateTimeKind.Utc).AddHours(5).ToString("dd.MM.yyyy HH:mm");
+}

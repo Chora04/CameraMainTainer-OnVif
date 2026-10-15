@@ -1,0 +1,131 @@
+@page "/Login"
+@attribute [Microsoft.AspNetCore.Authorization.AllowAnonymous]
+@inject Microsoft.Extensions.Configuration.IConfiguration Configuration
+@{
+    Layout = null;
+    var returnUrl = Request.Query["returnUrl"].ToString();
+    if (string.IsNullOrWhiteSpace(returnUrl) || !returnUrl.StartsWith('/') || !Url.IsLocalUrl(returnUrl)) returnUrl = "/";
+    var allowSelfRegistration = Configuration.GetValue("Accounts:AllowSelfRegistration", false);
+}
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f0f3f5">
+    <title>Camera Maintainer | Контроль и проверка камер</title>
+    <script>
+        (() => {
+            try {
+                const savedTheme = localStorage.getItem('cm_theme');
+                const theme = savedTheme === 'dark' || savedTheme === 'light'
+                    ? savedTheme
+                    : (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+                document.documentElement.dataset.theme = theme;
+                document.documentElement.style.colorScheme = theme;
+            } catch (_) {
+                document.documentElement.dataset.theme = 'light';
+            }
+        })();
+    </script>
+    <script src="~/js/localization.js" asp-append-version="true"></script>
+    <link rel="stylesheet" href="~/css/ops-dense.css?rev=air-console-v1" asp-append-version="true">
+</head>
+<body>
+    <main class="signin-page">
+        <header class="signin-brand">
+            <span class="brand-mark radar-mark"><i data-lucide="radar"></i></span>
+            <span class="signin-brand-copy"><strong>Camera Maintainer</strong><small>Контроль и проверка камер</small></span>
+            <div class="signin-header-actions">
+                <label class="language-switcher" title="Язык интерфейса">
+                    <i data-lucide="languages" aria-hidden="true"></i>
+                    <select data-language-selector onchange="window.uiLocale.setLanguage(this.value)" aria-label="Язык интерфейса">
+                        <option value="ru">Русский</option>
+                        <option value="uz-Latn">O‘zbekcha</option>
+                        <option value="uz-Cyrl">Ўзбекча</option>
+                    </select>
+                </label>
+                <button class="icon-button theme-toggle-button signin-theme-toggle" type="button" data-theme-toggle onclick="toggleColorTheme()" aria-label="Включить тёмную тему" title="Включить тёмную тему"><i class="theme-icon theme-icon-moon" data-lucide="moon"></i><i class="theme-icon theme-icon-sun" data-lucide="sun"></i></button>
+            </div>
+        </header>
+        <section class="signin-dialog">
+            <div class="signin-intro"><span class="eyebrow">ONVIF</span><h1>Camera Maintainer</h1><p>Контроль и проверка камер.</p></div>
+            <div class="login-box">
+                <div class="auth-tabs">
+                    <button class="auth-tab active" type="button" data-auth-tab="login">Вход</button>
+                    @if (allowSelfRegistration)
+                    {
+                        <button class="auth-tab" type="button" data-auth-tab="register">Регистрация</button>
+                    }
+                </div>
+                <form class="auth-form" id="login-form">
+                    <div><label class="form-label" for="login-username">Имя пользователя</label><input class="form-input" id="login-username" autocomplete="username" value="admin" required></div>
+                    <div><label class="form-label" for="login-password">Пароль</label><input class="form-input" id="login-password" type="password" autocomplete="current-password" required></div>
+                    <div class="auth-error" id="login-error"></div>
+                    <button class="btn btn-primary auth-submit" type="submit">Войти в систему</button>
+                </form>
+                @if (allowSelfRegistration)
+                {
+                    <form class="auth-form" id="register-form" hidden>
+                        <div><label class="form-label" for="register-name">Имя</label><input class="form-input" id="register-name" autocomplete="name" placeholder="Как к вам обращаться"></div>
+                        <div><label class="form-label" for="register-username">Имя пользователя</label><input class="form-input" id="register-username" autocomplete="username" required></div>
+                        <div><label class="form-label" for="register-password">Пароль</label><input class="form-input" id="register-password" type="password" autocomplete="new-password" minlength="8" required></div>
+                        <div class="auth-error" id="register-error"></div>
+                        <button class="btn btn-primary auth-submit" type="submit">Создать аккаунт</button>
+                        <div class="auth-note">Новый аккаунт получает доступ только к просмотру камер. Расширенные права выдаёт администратор.</div>
+                    </form>
+                }
+            </div>
+        </section>
+    </main>
+    <script src="~/js/vendor/lucide.min.js" asp-append-version="true"></script>
+    <script src="~/js/theme.js" asp-append-version="true"></script>
+    <script>
+        if (window.lucide) window.lucide.createIcons({ attrs: { 'aria-hidden': 'true', 'stroke-width': 1.8 } });
+        const returnUrl = @Html.Raw(System.Text.Json.JsonSerializer.Serialize(returnUrl));
+        const tabs = document.querySelectorAll('[data-auth-tab]');
+        const loginForm = document.getElementById('login-form');
+        const registerForm = document.getElementById('register-form');
+        tabs.forEach(tab => tab.addEventListener('click', () => {
+            tabs.forEach(item => item.classList.toggle('active', item === tab));
+            const login = tab.dataset.authTab === 'login';
+            loginForm.hidden = !login;
+            if (registerForm) registerForm.hidden = login;
+        }));
+        async function responseMessage(response) {
+            if (response.status === 429) return 'Слишком много попыток входа. Подождите одну минуту и повторите.';
+            try { const data = await response.json(); return data.message || 'Операция не выполнена'; } catch (_) { return 'Операция не выполнена'; }
+        }
+        loginForm.addEventListener('submit', async event => {
+            event.preventDefault(); const error = document.getElementById('login-error'); error.textContent = '';
+            const button = loginForm.querySelector('button[type=submit]'); button.disabled = true;
+            try {
+                const response = await fetch('/api/accounts/login', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: document.getElementById('login-username').value, password: document.getElementById('login-password').value }) });
+                if (!response.ok) throw new Error(await responseMessage(response));
+                const result = await response.json();
+                const account = result.account || {};
+                const landingPage = account.canViewCameras ? '/Cameras'
+                    : account.canViewAlerts ? '/Alerts?view=active'
+                    : account.canViewAlertHistory ? '/Alerts?view=history'
+                    : account.canManageUsers ? '/Users'
+                    : '/Settings';
+                window.location.href = returnUrl === '/' ? landingPage : returnUrl;
+            } catch (e) { error.textContent = e.message; button.disabled = false; }
+        });
+        if (registerForm) {
+            registerForm.addEventListener('submit', async event => {
+                event.preventDefault(); const error = document.getElementById('register-error'); error.textContent = '';
+                const button = registerForm.querySelector('button[type=submit]'); button.disabled = true;
+                const username = document.getElementById('register-username').value.trim(); const password = document.getElementById('register-password').value;
+                try {
+                    const response = await fetch('/api/accounts/register', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, displayName: document.getElementById('register-name').value.trim(), password }) });
+                    if (!response.ok) throw new Error(await responseMessage(response));
+                    document.getElementById('login-username').value = username; document.getElementById('login-password').value = password;
+                    document.querySelector('[data-auth-tab="login"]').click(); document.getElementById('login-error').textContent = 'Аккаунт создан. Теперь выполните вход.';
+                } catch (e) { error.textContent = e.message; }
+                button.disabled = false;
+            });
+        }
+    </script>
+</body>
+</html>

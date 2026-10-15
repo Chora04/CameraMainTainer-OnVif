@@ -1,0 +1,1137 @@
+@page "/Cameras"
+@attribute [Microsoft.AspNetCore.Authorization.Authorize(Policy = CameraMaintainer.Web.Security.AccessPolicies.ViewCameras)]
+@using CameraMaintainer.Core.Enums
+@using CameraMaintainer.Core.Interfaces
+@using CameraMaintainer.Core.Models
+@inject ICameraRepository CameraRepo
+@inject IHealthService HealthService
+@inject CameraMaintainer.Services.HealthCheckConcurrencyGate CheckConcurrency
+
+@{
+    ViewData["Title"] = "Камеры";
+    var summary = await HealthService.GetHealthSummaryAsync();
+    var excludedCameraCount = await CameraRepo.GetCountAsync(new CameraFilter { AutomaticChecksEnabled = false });
+    var pageSize = int.TryParse(Request.Query["perPage"], out var size) && size is 50 or 100 or 200 ? size : 50;
+    var requestedPage = int.TryParse(Request.Query["page"], out var number) ? Math.Max(number, 1) : 1;
+    const string excludedFilter = "ChecksExcluded";
+    var selectedStateFilter = Request.Query["status"].ToString();
+    var onlyExcluded = string.Equals(selectedStateFilter, excludedFilter, StringComparison.OrdinalIgnoreCase);
+    var filter = new CameraFilter { PerPage = pageSize, SortBy = "Id", SortDesc = false,
+        Attention = Request.Query["attention"] == "1", AutomaticChecksEnabled = onlyExcluded ? false : null };
+    if (!onlyExcluded && !string.IsNullOrWhiteSpace(selectedStateFilter)) filter.Status = selectedStateFilter;
+    if (Request.Query.ContainsKey("search")) filter.Search = Request.Query["search"];
+    var totalCameras = await CameraRepo.GetCountAsync(filter);
+    var totalPages = Math.Max(1, (int)Math.Ceiling(totalCameras / (double)pageSize));
+    filter.Page = Math.Min(requestedPage, totalPages);
+    var cameras = await CameraRepo.GetAllAsync(filter);
+    string PageUrl(int pageNumber) => Microsoft.AspNetCore.WebUtilities.QueryHelpers.AddQueryString("/Cameras",
+        new Dictionary<string, string?> { ["page"] = pageNumber.ToString(), ["perPage"] = pageSize.ToString(),
+            ["search"] = filter.Search, ["status"] = selectedStateFilter, ["attention"] = filter.Attention ? "1" : null });
+    var canManage = User.HasClaim(CameraMaintainer.Web.Security.AccessPolicies.PermissionClaim, CameraMaintainer.Web.Security.AccessPolicies.ManageCameras);
+    var canCheck = User.HasClaim(CameraMaintainer.Web.Security.AccessPolicies.PermissionClaim, CameraMaintainer.Web.Security.AccessPolicies.RunChecks);
+    var canManageCheckCycle = canManage && User.HasClaim(CameraMaintainer.Web.Security.AccessPolicies.PermissionClaim, CameraMaintainer.Web.Security.AccessPolicies.ViewMaintenance);
+    var canViewAlertHistory = User.HasClaim(CameraMaintainer.Web.Security.AccessPolicies.PermissionClaim, CameraMaintainer.Web.Security.AccessPolicies.ViewAlertHistory);
+    var canViewAlerts = User.HasClaim(CameraMaintainer.Web.Security.AccessPolicies.PermissionClaim, CameraMaintainer.Web.Security.AccessPolicies.ViewAlerts);
+}
+
+<header class="page-heading">
+    <div>
+        <h1>Камеры</h1>
+    </div>
+    <div class="page-actions">
+        @if (canManage)
+        {
+            <button class="btn btn-primary" type="button" onclick="openCameraEditor()"><i data-lucide="plus"></i> Добавить камеру</button>
+        }
+    </div>
+</header>
+
+<nav class="metric-strip" aria-label="Сводка состояния камер">
+    <a class="metric-button total" href="/Cameras"><span class="metric-caption">Всего камер</span><strong data-summary-value="total">@summary.Total</strong></a>
+    <a class="metric-button online" href="/Cameras?status=Online"><span class="metric-caption">В рабочем состоянии</span><strong data-summary-value="online">@summary.Online</strong></a>
+    <a class="metric-button offline" href="/Cameras?status=Offline"><span class="metric-caption">Нет связи</span><strong data-summary-value="offline">@summary.Offline</strong></a>
+    <a class="metric-button attention" href="/Cameras?attention=1"><span class="metric-caption">Нужна настройка</span><strong data-summary-value="attention">@(summary.Suspect + summary.Unknown)</strong></a>
+</nav>
+
+    <div class="empty-state" id="camera-registry-empty" hidden="@(cameras.Count != 0)"><div class="empty-icon"><i data-lucide="@(onlyExcluded ? "circle-check" : "cctv")"></i></div><div class="empty-title">@(onlyExcluded ? "Исключённых камер нет" : "Камеры не найдены")</div><p class="empty-description">@(onlyExcluded ? "Все камеры участвуют в автоматическом цикле проверок." : "Добавьте камеру вручную или измените параметры поиска.")</p>@if (canManage && !onlyExcluded) { <button class="btn btn-primary" onclick="openCameraEditor()"><i data-lucide="plus"></i> Добавить камеру</button> }</div>
+    <div class="device-console">
+        <div class="registry-tools">
+            <section class="registry-command-bar" aria-label="Фильтр камер">
+                <div class="search-input"><span class="search-icon"><i data-lucide="search"></i></span><input id="camera-search" class="form-input" value="@filter.Search" placeholder="Поиск по имени, IP или производителю" onkeydown="if(event.key==='Enter')applyFilters()"></div>
+                <select id="camera-status" class="form-select" onchange="applyFilters()">
+                    <option value="">Все состояния (@summary.Total)</option><option value="Online">Онлайн (@summary.Online)</option><option value="Suspect">Проверить (@summary.Suspect)</option><option value="Offline">Офлайн (@summary.Offline)</option><option value="Unknown">Нет данных (@summary.Unknown)</option><option value="@excludedFilter">Только исключённые (@excludedCameraCount)</option>
+                </select>
+                <button class="btn btn-secondary" type="button" onclick="applyFilters()"><i data-lucide="search"></i> Найти</button>
+                <span class="registry-total"><strong>@totalCameras</strong><small>устройств</small></span>
+            </section>
+
+            @if (canCheck)
+            {
+                <div class="bulk-actions" id="bulk-actions" hidden>
+                    <strong id="selected-count">0 выбрано</strong>
+                    <button class="btn btn-sm btn-warning" type="button" onclick="checkSelectedCameras()"><i data-lucide="circle-check"></i> Проверить выбранные</button>
+                    <button class="btn btn-sm btn-ghost" type="button" onclick="clearSelection()"><i data-lucide="rotate-ccw"></i> Сбросить</button>
+                    <span id="check-progress" class="form-help"></span>
+                </div>
+            }
+        </div>
+
+        <section class="camera-registry" data-page="@filter.Page" data-total="@totalCameras" hidden="@(cameras.Count == 0)">
+            <header class="registry-heading">
+                <div><h2>Список устройств</h2><p>Строгий порядок по ID</p></div>
+                <span class="badge badge-info">@cameras.Count</span>
+            </header>
+            <div class="registry-scroll">
+                <table class="data-table camera-table">
+                    <thead><tr>@if (canCheck) { <th><input type="checkbox" id="select-all" onchange="toggleSelectAll(this)" aria-label="Выбрать все"></th> }<th>№</th><th>Камера</th><th>Адрес</th><th>Статус</th></tr></thead>
+                    <tbody>
+                    @foreach (var camera in cameras)
+                    {
+                        var statusClass = StatusClass(camera.Status);
+                        <tr class="camera-registry-row" data-camera-row="@camera.Id" data-status="@camera.Status" data-automatic-checks-enabled="@(camera.AutomaticChecksEnabled ? "true" : "false")" onclick="selectCamera(@camera.Id)" tabindex="0" onkeydown="if(event.key==='Enter')selectCamera(@camera.Id)">
+                            @if (canCheck)
+                            {
+                                <td><input class="camera-checkbox" type="checkbox" value="@camera.Id" onchange="updateSelection()" onclick="event.stopPropagation()" aria-label="Выбрать @camera.Name"></td>
+                            }
+                            <td class="id-cell">@camera.Id</td>
+                            <td><strong>@camera.Name</strong><small class="text-muted registry-device">@DeviceLabel(camera)</small><small class="registry-location" data-camera-location>@(camera.StreetAddress ?? "Локация не указана")</small></td>
+                            <td><code class="ip-address">@(camera.IpAddress ?? "—")</code></td>
+                            <td><div class="registry-status-stack"><span class="status-cell status-text-@statusClass"><i class="status-dot @statusClass"></i>@StatusText(camera.Status)</span><span class="camera-check-cycle-state @(camera.AutomaticChecksEnabled ? "enabled" : "excluded")" data-check-cycle-state><i data-lucide="@(camera.AutomaticChecksEnabled ? "refresh-cw" : "circle-pause")"></i><span>@(camera.AutomaticChecksEnabled ? "В цикле проверок" : "Исключена из проверок")</span></span></div></td>
+                        </tr>
+                    }
+                    </tbody>
+                </table>
+            </div>
+            <nav class="registry-pagination" aria-label="Страницы камер">
+                <label for="camera-page-size">На странице</label>
+                <select class="form-select" id="camera-page-size" onchange="changeCameraPageSize(this.value)">
+                    @foreach (var option in new[] { 50, 100, 200 })
+                    {
+                        <option value="@option" selected="@(option == pageSize)">@option</option>
+                    }
+                </select>
+                <span>@filter.Page / @totalPages</span>
+                @if (filter.Page > 1)
+                {
+                    <a class="icon-button" href="@PageUrl(filter.Page - 1)" aria-label="Предыдущая страница" title="Предыдущая страница"><i data-lucide="chevron-left"></i></a>
+                }
+                @if (filter.Page < totalPages)
+                {
+                    <a class="icon-button" href="@PageUrl(filter.Page + 1)" aria-label="Следующая страница" title="Следующая страница"><i data-lucide="chevron-right"></i></a>
+                }
+            </nav>
+        </section>
+
+        <section class="camera-inspector" id="camera-inspector" aria-live="polite" hidden="@(cameras.Count == 0)">
+            <div class="inspector-header">
+                <div class="inspector-title">
+                    <div class="inspector-heading-meta"><span class="eyebrow">Данные выбранной камеры</span><span id="inspector-updated">—</span></div>
+                    <div class="inspector-identity"><h2 id="inspector-name">Загрузка...</h2><div class="inspector-location-block"><p class="inspector-location"><i data-lucide="map-pin" aria-hidden="true"></i><span id="inspector-subtitle">Локация не указана</span></p><a id="inspector-coordinates" target="_blank" rel="noopener noreferrer" title="Открыть на карте" hidden></a></div></div>
+                </div>
+                <div class="page-actions">
+                    <a class="btn btn-sm" id="inspector-open" href="#"><i data-lucide="external-link"></i> Открыть</a>
+                    @if (canManage)
+                    {
+                        <button class="btn btn-sm btn-secondary" type="button" onclick="openCameraEditor(selectedCameraId)"><i data-lucide="settings"></i> Настроить</button>
+                        <button class="btn btn-sm btn-danger" type="button" onclick="deleteCamera(selectedCameraId)"><i data-lucide="trash-2"></i> Удалить</button>
+                    }
+                    @if (canManageCheckCycle)
+                    {
+                        <button class="btn btn-sm btn-secondary camera-cycle-toggle" id="inspector-cycle-toggle" type="button"
+                                data-enabled="" aria-pressed="false" onclick="toggleAutomaticChecks(this)" disabled>
+                            <i data-lucide="loader-circle" class="icon-spin"></i><span>Загрузка...</span>
+                        </button>
+                    }
+                    @if (canCheck)
+                    {
+                        <button class="btn btn-sm btn-warning" id="inspector-check" type="button" onclick="checkCurrentCamera(this)"><i data-lucide="refresh-cw"></i> Проверить</button>
+                    }
+                </div>
+            </div>
+
+            <div class="inspector-content">
+                <section class="inspector-camera-data" aria-label="Данные камеры">
+                    <div class="telemetry-grid camera-data-grid">
+                        <div class="telemetry-item"><span>Производитель / модель</span><strong id="metric-device">—</strong></div>
+                        <div class="telemetry-item"><span>Ответ ONVIF</span><strong id="metric-onvif">—</strong></div>
+                        <div class="telemetry-item"><span>Дата и время камеры</span><strong id="metric-camera-time">—</strong></div>
+                        <div class="telemetry-item"><span>Прошивка</span><strong id="metric-firmware">—</strong></div>
+                        <div class="telemetry-item"><span>Расхождение времени</span><strong id="metric-drift">—</strong></div>
+                        <div class="telemetry-item"><span>Статус камеры</span><strong id="metric-status">—</strong></div>
+                        <div class="telemetry-item"><span>Последняя проверка</span><strong id="metric-last-check">—</strong></div>
+                        <div class="telemetry-item camera-data-address"><span>Улица / адрес · <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap</a></span><strong id="metric-street-address">Не указан</strong></div>
+                    </div>
+                </section>
+
+                <div class="inspector-analysis-grid">
+                    <section class="preview-diagnostics" aria-label="Диагностика камеры">
+                        <h3>Показатели диагностики</h3>
+                        <div class="diagnostic-comparison-heading" aria-hidden="true"><span>Сейчас</span><span>Норма / ориентир</span><span>Сейчас</span><span>Норма / ориентир</span><span>Сейчас</span><span>Норма / ориентир</span></div>
+                        <div class="telemetry-grid preview-telemetry" ondblclick="toggleDiagnosticDetails(event.target.closest('[data-diagnostic]'))" onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleDiagnosticDetails(event.target.closest('[data-diagnostic]')); }">
+                            <div class="telemetry-item" data-diagnostic role="button" tabindex="0" aria-expanded="false" title="Подробности показателя"><span>Оценка изображения</span><strong id="metric-lens">—</strong><b class="metric-ideal">Риск &lt; 52%</b><small hidden class="metric-evidence" id="metric-lens-evidence">—</small><small hidden class="metric-reference">Норма по шкале: ниже 52%; от 52% — проверить, от 72% — высокий риск. Это индекс признаков, не вероятность поломки.</small></div>
+                            <div class="telemetry-item" data-diagnostic role="button" tabindex="0" aria-expanded="false" title="Подробности показателя"><span>Средняя яркость</span><strong id="metric-brightness">—</strong><b class="metric-ideal">35–220 из 255</b><small hidden class="metric-reference">Ориентир оценки: 35–220 из 255. 0 — чёрный кадр, 255 — белый; ночной кадр может быть темнее.</small></div>
+                            <div class="telemetry-item" data-diagnostic role="button" tabindex="0" aria-expanded="false" title="Подробности показателя"><span>Контраст изображения</span><strong id="metric-contrast">—</strong><b class="metric-ideal">От 24</b><small hidden class="metric-reference">Ориентир оценки: от 24. Разброс яркости пикселей; низкое значение означает почти однотонный кадр.</small></div>
+                            <div class="telemetry-item" data-diagnostic role="button" tabindex="0" aria-expanded="false" title="Подробности показателя"><span>Доля контуров</span><strong id="metric-edges">—</strong><b class="metric-ideal">От 8%</b><small hidden class="metric-reference">Ориентир оценки: от 8%. Доля пикселей на границах предметов, а не процент исправности камеры.</small></div>
+                            <div class="telemetry-item" data-diagnostic role="button" tabindex="0" aria-expanded="false" title="Подробности показателя"><span>Разнообразие яркости (энтропия)</span><strong id="metric-entropy">—</strong><b class="metric-ideal">5–8 бит</b><small hidden class="metric-reference">Ориентир оценки: от 5 бит из 8. Чем выше, тем разнообразнее оттенки; шум тоже повышает значение.</small></div>
+                            <div class="telemetry-item" data-diagnostic role="button" tabindex="0" aria-expanded="false" title="Подробности показателя"><span>Время ответа сети (пинг)</span><strong id="metric-ping">—</strong><b class="metric-ideal">Ближе к 0 мс</b><small hidden class="metric-reference">Лучше ближе к 0 мс. Это время запроса до камеры и обратно; единая норма зависит от сети.</small></div>
+                            <div class="telemetry-item" data-diagnostic role="button" tabindex="0" aria-expanded="false" title="Подробности показателя"><span>Колебания задержки (джиттер)</span><strong id="metric-jitter">—</strong><b class="metric-ideal">Ближе к 0 мс</b><small hidden class="metric-reference">Ориентир: ближе к 0 мс, задержка стабильнее. Разброс времени успешных ответов; нужны хотя бы 2 ответа из 3.</small></div>
+                            <div class="telemetry-item" data-diagnostic role="button" tabindex="0" aria-expanded="false" title="Подробности показателя"><span>Потери проверочных пакетов</span><strong id="metric-packet-loss">—</strong><b class="metric-ideal">0%</b><small hidden class="metric-reference">Норма: 0%. Доля неотвеченных запросов из 3; это не измерение потерь видеопотока. Камера может блокировать пинг.</small></div>
+                            <div class="telemetry-item" data-diagnostic role="button" tabindex="0" aria-expanded="false" title="Подробности показателя"><span>Время загрузки кадра</span><strong id="metric-snapshot">—</strong><b class="metric-ideal">Меньше — лучше</b><small hidden class="metric-reference">Ожидается успешная загрузка. Меньше — быстрее; единой нормы в мс нет, время зависит от сети и размера кадра.</small></div>
+                            <div class="telemetry-item metric-without-reference"><span>Размер кадра</span><strong id="metric-snapshot-size">—</strong></div>
+                        </div>
+                    </section>
+
+                    <section class="inspector-preview" aria-label="Последний кадр камеры">
+                        <div class="inspector-section-title"><h3>Последний кадр ONVIF</h3><span id="frame-state">обновление</span></div>
+                        <div class="inspector-frame">
+                            <img id="inspector-frame-image" class="zoomable" alt="Последний кадр ONVIF" onclick="openImageViewer(this)" onload="handleInspectorFrameLoad(this)" onerror="handleInspectorFrameError()" hidden>
+                            <div class="inspector-frame-empty" id="inspector-frame-empty">Получение последнего кадра...</div>
+                        </div>
+                    </section>
+                </div>
+
+                @if (canViewAlertHistory)
+                {
+                    <button class="camera-alert-history-launch" type="button" onclick="openCameraAlertHistoryPopup()" aria-haspopup="dialog">
+                        <span>
+                            <i data-lucide="history"></i>
+                            <span>
+                                <strong id="camera-alert-history-title">История ошибок камеры</strong>
+                            </span>
+                        </span>
+                        <span class="camera-alert-history-summary-actions">
+                            <b id="camera-alert-history-count" aria-label="Количество ошибок">—</b>
+                            <i data-lucide="chevron-right" aria-hidden="true"></i>
+                        </span>
+                    </button>
+                }
+            </div>
+        </section>
+    </div>
+<div id="camera-editor" class="modal-overlay" hidden>
+    <div class="modal camera-settings-modal" role="dialog" aria-modal="true" aria-labelledby="camera-editor-title">
+        <div class="modal-header"><div><span class="eyebrow">ONVIF устройство</span><h3 id="camera-editor-title">Добавить камеру</h3></div><button class="icon-button modal-close" type="button" onclick="closeCameraEditor()" aria-label="Закрыть"><i data-lucide="x"></i></button></div>
+        <form id="camera-settings-form" onsubmit="event.preventDefault();saveCamera()">
+            <div class="modal-body camera-settings-body">
+                <input id="camera-id" type="hidden">
+                <input id="camera-auth-type" type="hidden" value="wsse">
+
+                <section class="settings-section" aria-labelledby="connection-settings-title">
+                    <div class="settings-section-header"><span class="settings-section-index">01</span><h4 id="connection-settings-title">Подключение</h4></div>
+                    <div class="settings-grid settings-connection-grid">
+                        <div class="form-group settings-field-wide"><label class="form-label" for="camera-name">Название</label><input id="camera-name" class="form-input" required placeholder="Например, Вход 1"></div>
+                        <div class="form-group"><label class="form-label" for="camera-ip">IP-адрес</label><input id="camera-ip" class="form-input" inputmode="decimal" required placeholder="192.168.1.100"></div>
+                        <div class="form-group"><label class="form-label" for="camera-port">Порт</label><input id="camera-port" class="form-input" type="number" min="1" max="65535" value="80" required></div>
+                        <div class="form-group settings-field-wide"><label class="form-label" for="camera-url">ONVIF service URL</label><input id="camera-url" class="form-input mono" placeholder="http://192.168.1.100:80/onvif/device_service"></div>
+                    </div>
+                </section>
+
+                <section class="settings-section" aria-labelledby="access-settings-title">
+                    <div class="settings-section-header"><span class="settings-section-index">02</span><h4 id="access-settings-title">Доступ к камере</h4><span class="settings-state" id="camera-credentials-state">Не настроен</span></div>
+                    <div class="settings-grid">
+                        <div class="form-group"><label class="form-label" for="camera-user">Имя пользователя</label><input id="camera-user" class="form-input" autocomplete="off" placeholder="admin"></div>
+                        <div class="form-group"><label class="form-label" for="camera-password">Пароль</label><input id="camera-password" class="form-input" type="password" autocomplete="new-password" placeholder="Не менять"></div>
+                    </div>
+                </section>
+
+                <section class="settings-section" aria-labelledby="monitoring-settings-title">
+                    <div class="settings-section-header"><span class="settings-section-index">03</span><h4 id="monitoring-settings-title">Мониторинг</h4></div>
+                    <div class="settings-grid">
+                        <div class="form-group"><label class="form-label" for="camera-interval">Интервал проверки, сек</label><input id="camera-interval" class="form-input" type="number" min="10" max="86400" step="10" value="3600" required></div>
+                        <div class="settings-toggle-group" role="group" aria-label="Автоматические действия">
+                            <label class="settings-toggle" for="camera-auto-backup"><input id="camera-auto-backup" type="checkbox" checked><span class="toggle-track" aria-hidden="true"></span><span>Авто-резервирование</span></label>
+                            <label class="settings-toggle" for="camera-auto-recovery"><input id="camera-auto-recovery" type="checkbox" checked><span class="toggle-track" aria-hidden="true"></span><span>Авто-восстановление</span></label>
+                        </div>
+                        <div class="form-group settings-field-wide"><label class="form-label" for="camera-tags">Метки</label><input id="camera-tags" class="form-input" placeholder="вход, этаж 1"></div>
+                        <div class="form-group settings-field-wide"><label class="form-label" for="camera-notes">Заметки</label><textarea id="camera-notes" class="form-input" rows="2"></textarea></div>
+                    </div>
+                </section>
+
+                <section class="settings-section" aria-labelledby="location-settings-title">
+                    <div class="settings-section-header"><span class="settings-section-index">04</span><h4 id="location-settings-title">Локация</h4></div>
+                    <div class="settings-grid">
+                        <div class="form-group"><label class="form-label" for="camera-latitude">Широта</label><input id="camera-latitude" class="form-input" type="number" min="-90" max="90" step="any" inputmode="decimal" placeholder="41.311081" oninput="cameraCoordinatesChanged()"></div>
+                        <div class="form-group"><label class="form-label" for="camera-longitude">Долгота</label><input id="camera-longitude" class="form-input" type="number" min="-180" max="180" step="any" inputmode="decimal" placeholder="69.240562" oninput="cameraCoordinatesChanged()"></div>
+                        <div class="form-group settings-field-wide"><label class="form-label" for="camera-street-address">Улица / адрес</label><input id="camera-street-address" class="form-input" maxlength="600" placeholder="Не указан"></div>
+                        <div class="location-lookup-actions settings-field-wide"><button type="button" class="btn btn-secondary" id="camera-location-lookup" onclick="resolveCameraStreet()" title="Отправить координаты в картографический сервис"><i data-lucide="map-pin"></i> Определить улицу</button><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap</a></div>
+                        <div id="camera-location-status" class="settings-field-wide" role="status"></div>
+                    </div>
+                </section>
+                <div id="camera-editor-status" class="camera-settings-status" role="status"></div>
+            </div>
+            <div class="modal-footer"><button class="btn btn-secondary" type="button" onclick="closeCameraEditor()">Отмена</button><button class="btn btn-primary" id="save-camera-button" type="submit"><i data-lucide="save"></i> Сохранить настройки</button></div>
+        </form>
+    </div>
+</div>
+
+@section Scripts {
+<script>
+    let editingCameraId = null;
+    let editingCameraHasCredentials = false;
+    let selectedCameraId = null;
+    let selectedCameraIp = '';
+    let selectionRequest = 0;
+    let cameraPageRefreshPromise = null;
+    let cameraEditorBackdropPressed = false;
+    let cameraLocationRequest = 0;
+    let cameraAlertHistoryItems = [];
+    let cameraAlertHistoryLoadError = '';
+    const initialCameraId = @(cameras.FirstOrDefault()?.Id ?? 0);
+    const cameraCheckConcurrency = @CheckConcurrency.MaxConcurrency;
+    const cameraStatus = '@selectedStateFilter';
+    const canViewCameraAlertHistory = @(canViewAlertHistory ? "true" : "false");
+    const canOpenCameraAlertCard = @(canViewAlerts ? "true" : "false");
+    document.addEventListener('DOMContentLoaded', async function () {
+        const cameraEditor = document.getElementById('camera-editor');
+        if (cameraEditor) {
+            cameraEditor.addEventListener('pointerdown', function (event) {
+                cameraEditorBackdropPressed = event.target === cameraEditor;
+            });
+            cameraEditor.addEventListener('pointerup', function (event) {
+                const shouldClose = cameraEditorBackdropPressed && event.target === cameraEditor;
+                cameraEditorBackdropPressed = false;
+                if (shouldClose) closeCameraEditor();
+            });
+            cameraEditor.addEventListener('pointercancel', function () {
+                cameraEditorBackdropPressed = false;
+            });
+        }
+        const select = document.getElementById('camera-status');
+        if (select) select.value = cameraStatus;
+        if (location.hash === '#add') openCameraEditor();
+        if (!await restoreCameraHistoryReturn() && initialCameraId > 0) selectCamera(initialCameraId);
+        document.addEventListener('camera-maintainer:data-refresh', event => {
+            event.detail.waitUntil(refreshCameraPageData(event.detail));
+        });
+    });
+
+    function setMetric(id, value, tone) {
+        const element = document.getElementById(id);
+        if (!element) return;
+        element.textContent = value == null || value === '' ? '—' : value;
+        element.classList.remove('metric-ok', 'metric-warning', 'metric-danger');
+        if (tone) element.classList.add('metric-' + tone);
+    }
+
+    function statusInfo(value) {
+        const key = typeof value === 'number' ? value : String(value || '').toLowerCase();
+        if (key === 1 || key === 'online') return { text: 'Онлайн', css: 'online', tone: 'ok' };
+        if (key === 2 || key === 'suspect') return { text: 'Требует проверки', css: 'suspect', tone: 'warning' };
+        if (key === 3 || key === 'offline') return { text: 'Офлайн', css: 'offline', tone: 'danger' };
+        return { text: 'Нет данных', css: 'unknown', tone: '' };
+    }
+
+    function asUtcDate(value) {
+        if (!value) return null;
+        let source = String(value);
+        if (!/[zZ]|[+\-]\d\d:\d\d$/.test(source)) source += 'Z';
+        const date = new Date(source);
+        return Number.isNaN(date.getTime()) ? null : date;
+    }
+
+    function tashkentDateTime(value) {
+        const date = asUtcDate(value);
+        if (!date) return '—';
+        return new Intl.DateTimeFormat(window.uiLocale?.intlLocale || 'ru-RU', {
+            timeZone: 'Asia/Tashkent', day: '2-digit', month: '2-digit', year: 'numeric',
+            hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+        }).format(date).replace(',', '');
+    }
+
+    function fixed(value, digits) {
+        if (value == null || value === '') return '—';
+        const number = Number(value);
+        return Number.isFinite(number) ? number.toFixed(digits) : '—';
+    }
+
+    function formatCoordinate(value) {
+        if (value == null || value === '') return '';
+        const number = Number(value);
+        return Number.isFinite(number) ? number.toFixed(6).replace(/\.?0+$/, '') : '';
+    }
+
+    function parseHealthDetail(value) {
+        if (!value) return {};
+        try { return JSON.parse(value); }
+        catch (_) { return {}; }
+    }
+
+    function lensInfo(detail) {
+        if (detail.SnapshotSizeBytes != null && detail.SnapshotSizeBytes <= 0)
+            return { available: false, text: 'Нет данных для расчёта', tone: '' };
+        return CameraLensMath.assess({
+            mean: detail.MeanBrightness,
+            variance: detail.ImageVariance,
+            entropy: detail.ImageEntropy,
+            edges: detail.EdgeDensity
+        });
+    }
+
+    function setLensAssessment(assessment, source = 'По кадру последней проверки') {
+        setMetric('metric-lens', assessment.text, assessment.tone);
+        const evidence = document.getElementById('metric-lens-evidence');
+        if (evidence) evidence.textContent = assessment.available
+            ? source + '. Ориентиры зависят от сцены и не подтверждают неисправность сами по себе.'
+            : 'Нужен доступный кадр для анализа.';
+        const value = (key, digits, unit) => assessment.available && assessment[key] != null
+            ? fixed(assessment[key], digits) + unit : 'Нет данных';
+        setMetric('metric-brightness', value('mean', 1, ' из 255'));
+        setMetric('metric-contrast', value('stdDev', 1, ''));
+        setMetric('metric-edges', value('edges', 2, '%'));
+        setMetric('metric-entropy', value('entropy', 2, ' бит'));
+    }
+
+    function setNetworkDiagnostics(detail) {
+        const present = value => value != null && value !== '' && Number.isFinite(Number(value));
+        setMetric('metric-ping', present(detail.PingAvgMs) ? fixed(detail.PingAvgMs, 1) + ' мс' : 'Нет ответа или нет измерения');
+        setMetric('metric-jitter', present(detail.JitterMs) ? fixed(detail.JitterMs, 1) + ' мс' : 'Недостаточно ответов');
+        setMetric('metric-packet-loss', present(detail.PacketLossPercent) ? fixed(detail.PacketLossPercent, 1) + '%' : 'Нет измерения',
+            present(detail.PacketLossPercent) ? (Number(detail.PacketLossPercent) === 0 ? 'ok' : 'warning') : '');
+        const hasFrame = present(detail.SnapshotSizeBytes) && Number(detail.SnapshotSizeBytes) > 0;
+        setMetric('metric-snapshot', hasFrame && present(detail.SnapshotDownloadMs) ? fixed(detail.SnapshotDownloadMs, 0) + ' мс' : 'Нет измерения');
+        setMetric('metric-snapshot-size', hasFrame ? fixed(Number(detail.SnapshotSizeBytes) / 1024, 1) + ' КБ' : 'Нет измерения');
+    }
+
+    function toggleDiagnosticDetails(row) {
+        if (!row || !row.matches('[data-diagnostic]')) return;
+        const expanded = row.getAttribute('aria-expanded') !== 'true';
+        row.setAttribute('aria-expanded', String(expanded));
+        row.querySelectorAll('.metric-reference, .metric-evidence').forEach(detail => { detail.hidden = !expanded; });
+    }
+
+    async function selectCamera(id, options) {
+        if (!id) return;
+        const silent = Boolean(options && options.silent);
+        selectedCameraId = Number(id);
+        const request = ++selectionRequest;
+        const inspector = document.getElementById('camera-inspector');
+        if (!silent) inspector.classList.add('loading');
+        document.querySelectorAll('[data-camera-row]').forEach(row => row.classList.toggle('selected', Number(row.dataset.cameraRow) === selectedCameraId));
+
+        try {
+            const [camera, health, cameraAlerts] = await Promise.all([
+                apiFetch('/api/cameras/' + selectedCameraId),
+                apiFetch('/api/cameras/' + selectedCameraId + '/health').catch(error => error.status === 404 ? null : Promise.reject(error)),
+                canViewCameraAlertHistory && options?.refreshHistory !== false
+                    ? apiFetch('/api/alerts/camera/' + selectedCameraId + '/history?limit=30').catch(error => ({ loadError: error.message }))
+                    : Promise.resolve(null)
+            ]);
+            if (request !== selectionRequest) return;
+            const detail = parseHealthDetail(health?.detailJson);
+            const status = statusInfo(camera.status);
+            const device = [detail.Manufacturer || camera.manufacturer, detail.Model || camera.model].filter(Boolean).join(' / ') || '—';
+            const lens = lensInfo(detail);
+            const drift = Number(detail.TimeDriftSeconds);
+            const hasDrift = Number.isFinite(drift);
+
+            document.getElementById('inspector-name').textContent = camera.name || ('Камера ' + camera.id);
+            selectedCameraIp = camera.ipAddress || 'IP не указан';
+            const latitude = formatCoordinate(camera.latitude);
+            const longitude = formatCoordinate(camera.longitude);
+            const hasCoordinates = latitude !== '' && longitude !== '';
+            document.getElementById('inspector-subtitle').textContent = camera.streetAddress?.trim() || 'Локация не указана';
+            const coordinates = document.getElementById('inspector-coordinates');
+            coordinates.textContent = hasCoordinates ? latitude + ', ' + longitude : '';
+            coordinates.hidden = !hasCoordinates;
+            if (hasCoordinates) {
+                coordinates.href = 'https://www.openstreetmap.org/?mlat=' + encodeURIComponent(latitude)
+                    + '&mlon=' + encodeURIComponent(longitude) + '#map=18/' + encodeURIComponent(latitude) + '/' + encodeURIComponent(longitude);
+                coordinates.setAttribute('aria-label', 'Открыть на карте: широта ' + latitude + ', долгота ' + longitude);
+            } else {
+                coordinates.removeAttribute('href');
+                coordinates.removeAttribute('aria-label');
+            }
+            document.getElementById('inspector-open').href = '/Cameras/Detail/' + camera.id;
+            document.getElementById('inspector-updated').textContent = health ? 'Обновлено: ' + tashkentDateTime(health.checkedAt) : 'Проверка ещё не выполнялась';
+            syncAutomaticChecksButton(document.getElementById('inspector-cycle-toggle'), Boolean(camera.automaticChecksEnabled));
+
+            setMetric('metric-device', device);
+            setMetric('metric-onvif', health ? health.responseTimeMs + ' мс, ' + (health.reachable ? 'успешно' : (health.statusCode || 'ошибка')) : '—', health && health.reachable ? 'ok' : (health ? 'danger' : ''));
+            setMetric('metric-camera-time', tashkentDateTime(detail.CameraTime));
+            setMetric('metric-firmware', detail.FirmwareVersion || camera.firmwareVersion || '—');
+            setMetric('metric-drift', hasDrift ? fixed(Math.abs(drift), 3) + ' сек' : '—', hasDrift ? (Math.abs(drift) > 30 ? 'danger' : Math.abs(drift) > 5 ? 'warning' : 'ok') : '');
+            setMetric('metric-street-address', camera.streetAddress || 'Не указан');
+            setLensAssessment(lens);
+            setMetric('metric-status', status.text, status.tone);
+            setNetworkDiagnostics(detail);
+            setMetric('metric-last-check', health ? tashkentDateTime(health.checkedAt) : tashkentDateTime(camera.lastCheckAt));
+
+            const row = document.querySelector('[data-camera-row="' + camera.id + '"]');
+            const rowStatus = row?.querySelector('.status-cell');
+            if (rowStatus) { rowStatus.className = 'status-cell status-text-' + status.css; rowStatus.innerHTML = '<i class="status-dot ' + status.css + '"></i>' + status.text; }
+
+            const image = document.getElementById('inspector-frame-image');
+            const empty = document.getElementById('inspector-frame-empty');
+            const frameVersion = camera.id + ':' + (health?.checkedAt || camera.lastCheckAt || 'unchecked');
+            if (image.dataset.version !== frameVersion) {
+                image.hidden = false; empty.hidden = true;
+                image.dataset.cameraId = camera.id;
+                image.dataset.version = frameVersion;
+                image.src = '/api/cameras/' + camera.id + '/live-frame?v=' + encodeURIComponent(frameVersion);
+                document.getElementById('frame-state').textContent = 'анализ кадра';
+            }
+            if (canViewCameraAlertHistory && cameraAlerts !== null) renderCameraAlertHistory(cameraAlerts);
+        } catch (error) {
+            if (request === selectionRequest) showToast(error.message, 'error');
+        } finally {
+            if (request === selectionRequest && !silent) inspector.classList.remove('loading');
+        }
+    }
+
+    const cameraAlertTitles = {
+        0: 'Камера не отвечает',
+        1: 'Высокая температура камеры',
+        2: 'Требуется обновление прошивки',
+        3: 'Ошибка авторизации ONVIF',
+        4: 'Изменились настройки камеры',
+        5: 'Ошибка автоматического восстановления',
+        6: 'Проблема с объективом камеры'
+    };
+    const cameraAlertStages = {
+        new: 'Новая',
+        assigned: 'Назначена технику',
+        working: 'В работе',
+        waiting: 'Ожидает уточнения',
+        review: 'На проверке',
+        ready: 'Готова к закрытию',
+        closed: 'Закрыта'
+    };
+    const cameraAuditPresentation = {
+        created: { label: 'Начало ошибки', icon: 'circle-alert' },
+        viewed: { label: 'Карточка открыта', icon: 'eye' },
+        assigned: { label: 'Назначен ответственный', icon: 'user-check' },
+        stage_changed: { label: 'Изменён этап работы', icon: 'arrow-right' },
+        work_updated: { label: 'Обновлена информация о работе', icon: 'file-pen-line' },
+        handoff_created: { label: 'Работа передана сотруднику', icon: 'send' },
+        handoff_viewed: { label: 'Передача просмотрена', icon: 'eye' },
+        handoff_accepted: { label: 'Переданная работа принята', icon: 'badge-check' },
+        handoff_forwarded: { label: 'Работа передана дальше', icon: 'forward' },
+        handoff_completed: { label: 'Переданная работа завершена', icon: 'circle-check' },
+        handoff_rejected: { label: 'Переданная работа возвращена', icon: 'undo-2' },
+        resolved: { label: 'Ошибка закрыта', icon: 'circle-check' },
+        auto_resolved: { label: 'Закрыта автоматически', icon: 'refresh-cw' },
+        issue_added: { label: 'Добавлена ошибка', icon: 'plus' },
+        issue_updated: { label: 'Ошибка уточнена', icon: 'pencil' },
+        issue_recovered: { label: 'Ошибка устранена', icon: 'circle-check' },
+        recovery_detected: { label: 'Все ошибки устранены', icon: 'circle-check' },
+        recovery_lost: { label: 'Ошибка появилась повторно', icon: 'rotate-ccw' },
+        case_merged: { label: 'Карточки объединены', icon: 'combine' },
+        legacy_imported: { label: 'Начальная запись', icon: 'history' }
+    };
+
+    function alertEnumKey(value) {
+        return typeof value === 'number' ? value : String(value ?? '').toLowerCase();
+    }
+
+    function cameraAlertTitle(alert) {
+        const key = alertEnumKey(alert.alertType);
+        const enumNames = {
+            cameraoffline: 0, temperaturehigh: 1, firmwareoutdated: 2,
+            authenticationfailed: 3, configurationchanged: 4,
+            autorecoveryfailed: 5, lensobstructed: 6
+        };
+        return cameraAlertTitles[enumNames[key] ?? key] || alert.title || 'Ошибка камеры';
+    }
+
+    function cameraAlertCategory(alert) {
+        const key = alertEnumKey(alert.category);
+        return key === 1 || key === 'physical'
+            ? { css: 'physical', text: 'Физическая' }
+            : { css: 'technical', text: 'Техническая' };
+    }
+
+    function cameraAlertStage(alert) {
+        if (alert.autoResolved) return 'Закрыта';
+        return cameraAlertStages[String(alert.workflowStage || 'new').toLowerCase()] || alert.workflowStage || 'Новая';
+    }
+
+    function parseAuditState(value) {
+        if (!value) return null;
+        try { return typeof value === 'string' ? JSON.parse(value) : value; }
+        catch (_) { return null; }
+    }
+
+    function renderCameraAlertHistory(value) {
+        const count = document.getElementById('camera-alert-history-count');
+        if (!count) return;
+
+        if (value && value.loadError) {
+            cameraAlertHistoryItems = [];
+            cameraAlertHistoryLoadError = value.loadError;
+            count.textContent = '!';
+            count.title = 'История не загружена';
+            if (document.querySelector('.camera-alert-popup')) openCameraAlertHistoryPopup(true);
+            return;
+        }
+
+        const alerts = Array.isArray(value) ? value : [];
+        cameraAlertHistoryItems = alerts;
+        cameraAlertHistoryLoadError = '';
+        count.textContent = String(alerts.length);
+        count.title = alerts.length ? alerts.length + ' ' + pluralizeErrors(alerts.length) : 'Ошибок нет';
+        if (document.querySelector('.camera-alert-popup')) openCameraAlertHistoryPopup(true);
+    }
+
+    function openCameraAlertHistoryPopup(refresh = false) {
+        const cameraName = document.getElementById('inspector-name')?.textContent || 'камера';
+        const popup = document.querySelector('.camera-alert-popup');
+        const opened = new Set(Array.from(popup?.querySelectorAll('details[open]') || []).map(item => item.dataset.alertId));
+        let body;
+        if (cameraAlertHistoryLoadError) {
+            body = '<div class="camera-alert-history-empty error">' + escapeHtml(cameraAlertHistoryLoadError) + '</div>';
+        } else if (!cameraAlertHistoryItems.length) {
+            body = '<div class="camera-alert-history-empty"><i data-lucide="circle-check"></i><span><strong>Ошибок по этой камере нет</strong><small>Здесь появятся только зафиксированные неисправности.</small></span></div>';
+        } else {
+            body = '<div class="camera-alert-history-list camera-alert-popup-list">' + cameraAlertHistoryItems.map(renderCameraAlertCard).join('') + '</div>';
+        }
+
+        if (refresh && popup) {
+            const scroll = document.getElementById('modal-body').scrollTop;
+            popup.innerHTML = body;
+            popup.querySelectorAll('details').forEach(item => { item.open = opened.has(item.dataset.alertId); });
+            document.getElementById('modal-body').scrollTop = scroll;
+            renderIcons();
+            return;
+        }
+        showModal(
+            'История ошибок · ' + cameraName + ' · ' + selectedCameraIp,
+            '<section class="camera-alert-popup">' + body + '</section>',
+            '<button class="btn btn-secondary" type="button" onclick="closeModal()">Закрыть</button>');
+    }
+
+    function pluralizeErrors(count) {
+        const mod100 = count % 100;
+        const mod10 = count % 10;
+        if (mod100 >= 11 && mod100 <= 19) return 'ошибок';
+        if (mod10 === 1) return 'ошибка';
+        if (mod10 >= 2 && mod10 <= 4) return 'ошибки';
+        return 'ошибок';
+    }
+
+    function renderCameraAlertCard(alert) {
+        const category = cameraAlertCategory(alert);
+        const events = Array.isArray(alert.auditEvents)
+            ? [...alert.auditEvents].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+            : [];
+        const assigneeView = events.find(item =>
+            item.eventType === 'viewed' &&
+            ((alert.assignedToUserId && item.actorUserId === alert.assignedToUserId) ||
+             (alert.assignedToUsername && item.actorUsername === alert.assignedToUsername)));
+        const viewedState = !alert.assignedToUserId && !alert.assignedToUsername
+            ? '<span class="camera-alert-owner-state pending"><i data-lucide="user-round-x"></i>Ответственный не назначен</span>'
+            : assigneeView
+                ? '<span class="camera-alert-owner-state opened"><i data-lucide="eye"></i>Ответственный открыл: ' + escapeHtml(tashkentDateTime(assigneeView.createdAt)) + '</span>'
+                : '<span class="camera-alert-owner-state pending"><i data-lucide="eye-off"></i>Ответственный ещё не открыл карточку</span>';
+        const report = alert.workReport
+            ? '<div class="camera-alert-work-report"><small>Отчёт о работе</small><p>' + escapeHtml(alert.workReport) + '</p></div>'
+            : '<div class="camera-alert-work-report empty"><small>Отчёт о работе</small><p>Пока не заполнен</p></div>';
+        const resolvedAt = alert.resolvedAt
+            ? '<span><small>Закрыта</small><b>' + escapeHtml(tashkentDateTime(alert.resolvedAt)) + '</b></span>'
+            : '';
+        const compactEnd = alert.resolvedAt
+            ? '<i data-lucide="arrow-right"></i><span><small>Конец ошибки</small><strong>' + escapeHtml(tashkentDateTime(alert.resolvedAt)) + '</strong></span>'
+            : '';
+
+        const stage = cameraAlertStage(alert);
+        const alertId = Number(alert.id);
+        const serialNumber = alert.alertSerialNumber || ('SYS-' + alertId);
+        const openCard = canOpenCameraAlertCard && Number.isSafeInteger(alertId) && alertId > 0
+            ? '<a class="camera-alert-card-open" href="/Alerts?view=' + (alert.autoResolved ? 'history' : 'active') + '&amp;alert=' + alertId + '" title="Открыть карточку" aria-label="Открыть карточку ' + escapeHtml(serialNumber) + '" onclick="rememberCameraHistoryReturn(event,this)"><svg data-lucide="maximize-2" aria-hidden="true"></svg></a>'
+            : '';
+        return '<details data-alert-id="' + alert.id + '" class="camera-alert-record ' + category.css + (alert.autoResolved ? ' resolved' : ' active') + '" ondblclick="openCameraHistoryCard(event)">' +
+            '<summary onclick="handleCameraHistoryClick(event)">' +
+                '<span class="camera-alert-card-face">' +
+                    '<span class="camera-alert-card-route ' + (alert.resolvedAt ? 'has-end' : 'active-error') + '"><span><small>Начало ошибки</small><strong>' + escapeHtml(tashkentDateTime(alert.createdAt)) + '</strong></span>' + compactEnd + '</span>' +
+                    '<b class="camera-alert-card-compact-type">' + escapeHtml(category.text) + '</b>' +
+                '</span>' +
+                '<span class="camera-alert-card-tools"><i title="Раскрыть подробности" aria-hidden="true"><svg data-lucide="chevron-down"></svg></i>' + openCard + '</span>' +
+            '</summary>' +
+            '<div class="camera-alert-record-details">' +
+                '<div class="camera-alert-record-facts"><span><small>Серийный номер</small><b>' + escapeHtml(serialNumber) + '</b></span><span><small>Текущий этап</small><b>' + escapeHtml(stage) + '</b></span>' + resolvedAt + '</div>' +
+                viewedState + report + renderCameraCaseIssues(alert.issues) +
+                '<div class="camera-alert-timeline"><h4>Ход работы</h4>' + renderCameraAuditEvents(events) + '</div>' +
+            '</div>' +
+        '</details>';
+    }
+
+    function rememberCameraHistoryReturn(event, link) {
+        event.stopPropagation();
+        if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+        const destination = new URL(link.href, location.origin);
+        const context = {
+            url: location.pathname + location.search,
+            cameraId: selectedCameraId,
+            alertId: Number(destination.searchParams.get('alert')),
+            expanded: [...document.querySelectorAll('.camera-alert-record[open]')].map(item => item.dataset.alertId),
+            modalScroll: document.getElementById('modal-body').scrollTop,
+            pageScroll: window.scrollY
+        };
+        try {
+            sessionStorage.setItem('camera-maintainer:history-return', JSON.stringify(context));
+            history.replaceState({ ...history.state, cameraHistoryReturn: true }, '');
+            destination.searchParams.set('fromCameraHistory', '1');
+            link.href = destination.pathname + destination.search;
+        } catch { }
+    }
+
+    async function restoreCameraHistoryReturn() {
+        const url = new URL(location.href);
+        if (url.searchParams.get('restoreCameraHistory') !== '1' && !history.state?.cameraHistoryReturn) return false;
+        url.searchParams.delete('restoreCameraHistory');
+        history.replaceState({ ...history.state, cameraHistoryReturn: false }, '', url.pathname + url.search + url.hash);
+        let context;
+        try {
+            context = JSON.parse(sessionStorage.getItem('camera-maintainer:history-return') || 'null');
+            sessionStorage.removeItem('camera-maintainer:history-return');
+        } catch { return false; }
+        if (!canViewCameraAlertHistory || !context || context.url !== url.pathname + url.search ||
+            !Number.isSafeInteger(context.cameraId) || context.cameraId <= 0) return false;
+        await selectCamera(context.cameraId);
+        openCameraAlertHistoryPopup();
+        const expanded = new Set(Array.isArray(context.expanded) ? context.expanded : []);
+        document.querySelectorAll('.camera-alert-record').forEach(item => item.open = expanded.has(item.dataset.alertId));
+        document.getElementById('modal-body').scrollTop = Number(context.modalScroll) || 0;
+        window.scrollTo(0, Number(context.pageScroll) || 0);
+        return true;
+    }
+
+    function handleCameraHistoryClick(event) {
+        const record = event.target.closest('.camera-alert-record');
+        if (event.detail > 0 && event.target.closest('.camera-alert-card-face') && record?.querySelector('.camera-alert-card-open')) {
+            event.preventDefault();
+        }
+    }
+
+    function openCameraHistoryCard(event) {
+        if (event.target.closest('a, button, input, select, textarea, .camera-alert-card-tools')) return;
+        const link = event.target.closest('.camera-alert-record')?.querySelector('.camera-alert-card-open');
+        if (!link) return;
+        event.preventDefault();
+        link.click();
+    }
+
+    function renderCameraAuditEvents(events) {
+        if (!events.length) return '<p class="camera-alert-history-empty compact">Действия по ошибке ещё не записаны.</p>';
+
+        return events.map(function (item) {
+            const presentation = cameraAuditPresentation[item.eventType] || { label: 'Изменение', icon: 'pencil' };
+            const actor = item.actorDisplayName || item.actorUsername || 'Система';
+            const state = parseAuditState(item.eventType === 'case_merged' ? item.previousValuesJson : item.newValuesJson);
+            let extra = '';
+            if ((item.eventType === 'work_updated' || item.eventType === 'case_merged') && state?.workReport)
+                extra = '<blockquote>' + escapeHtml(state.workReport) + '</blockquote>';
+            if (state?.handoff) extra += renderHandoffAudit(state.handoff);
+            return '<article class="camera-alert-timeline-event"><span class="camera-alert-timeline-icon"><i data-lucide="' + presentation.icon + '"></i></span><span><strong>' + escapeHtml(presentation.label) + '</strong><small>' + escapeHtml(tashkentDateTime(item.createdAt)) + ' · ' + escapeHtml(actor) + '</small><p>' + escapeHtml(item.summary || presentation.label) + '</p>' + extra + '</span></article>';
+        }).join('');
+    }
+
+    function updateCameraRegistryRows(cameras) {
+        if (!Array.isArray(cameras)) return;
+        cameras.forEach(function(camera) {
+            const row = document.querySelector('[data-camera-row="' + camera.id + '"]');
+            if (!row) return;
+            const status = statusInfo(camera.status);
+            row.dataset.status = camera.status;
+            const statusCell = row.querySelector('.status-cell');
+            if (statusCell) {
+                statusCell.className = 'status-cell status-text-' + status.css;
+                statusCell.innerHTML = '<i class="status-dot ' + status.css + '"></i>' + status.text;
+            }
+            const name = row.querySelector('.id-cell + td strong');
+            const device = row.querySelector('.registry-device');
+            const address = row.querySelector('.ip-address');
+            if (name) name.textContent = camera.name || ('Камера ' + camera.id);
+            if (device) device.textContent = [camera.manufacturer, camera.model].filter(Boolean).join(' ') || 'ONVIF-устройство';
+            const location = row.querySelector('[data-camera-location]');
+            if (location) location.textContent = camera.streetAddress || 'Локация не указана';
+            if (address) address.textContent = camera.ipAddress || '—';
+            syncRegistryCheckCycle(row, Boolean(camera.automaticChecksEnabled));
+        });
+        renderIcons();
+    }
+
+    async function refreshCameraRegistry() {
+        const page = await readLivePage();
+        const current = document.querySelector('.camera-registry');
+        const next = page.querySelector('.camera-registry');
+        if (!current || !next) return;
+        const checked = new Set(getSelectedIds());
+        const scroll = current.querySelector('.registry-scroll').scrollTop;
+        next.querySelectorAll('.camera-checkbox').forEach(box => { box.checked = checked.has(Number(box.value)); });
+        current.replaceWith(next);
+        next.querySelector('.registry-scroll').scrollTop = scroll;
+        const rows = next.querySelectorAll('[data-camera-row]');
+        document.getElementById('camera-inspector').hidden = rows.length === 0;
+        document.getElementById('camera-registry-empty').hidden = rows.length !== 0;
+        document.querySelector('.registry-total strong').textContent = next.dataset.total;
+        const currentStateFilter = document.getElementById('camera-status');
+        const nextStateFilter = page.getElementById('camera-status');
+        if (currentStateFilter && nextStateFilter) {
+            const selectedValue = currentStateFilter.value;
+            currentStateFilter.innerHTML = nextStateFilter.innerHTML;
+            currentStateFilter.value = selectedValue;
+        }
+        const url = new URL(location.href);
+        url.searchParams.set('page', next.dataset.page);
+        history.replaceState(null, '', url);
+        if (!next.querySelector('[data-camera-row="' + selectedCameraId + '"]')) {
+            selectedCameraId = 0;
+            if (rows.length) await selectCamera(Number(rows[0].dataset.cameraRow));
+            else if (document.querySelector('.camera-alert-popup')) closeModal();
+        } else next.querySelector('[data-camera-row="' + selectedCameraId + '"]').classList.add('selected');
+        if (document.getElementById('bulk-actions')) updateSelection();
+        renderIcons();
+    }
+
+    function refreshCameraPageData(detail) {
+        if (cameraPageRefreshPromise) return cameraPageRefreshPromise;
+        cameraPageRefreshPromise = (async function() {
+            const tasks = [];
+            const registryRefreshed = detail?.topics.includes('registry');
+            if (registryRefreshed) await refreshCameraRegistry();
+            const refreshCameras = !detail || detail.topics.includes('cameras');
+            const cameraIds = detail?.cameraIds;
+            const refreshSelected = refreshCameras && selectedCameraId &&
+                (!cameraIds || cameraIds.includes(selectedCameraId));
+            if (refreshCameras && !registryRefreshed) {
+                const visibleIds = [...document.querySelectorAll('[data-camera-row]')].map(row => Number(row.dataset.cameraRow));
+                const changed = cameraIds ? new Set(cameraIds) : null;
+                const ids = visibleIds.filter(id => !changed || changed.has(id));
+                if (ids.length) {
+                    const query = new URLSearchParams(ids.map(id => ['ids', id]));
+                    tasks.push(apiFetch('/api/cameras/lookup?' + query).then(updateCameraRegistryRows));
+                }
+            }
+            if (refreshSelected) tasks.push(selectCamera(selectedCameraId, {
+                silent: true, refreshHistory: !detail || detail.topics.includes('alerts')
+            }));
+            else if (detail?.topics.includes('alerts') && canViewCameraAlertHistory && selectedCameraId) {
+                const cameraId = selectedCameraId;
+                tasks.push(apiFetch('/api/alerts/camera/' + cameraId + '/history?limit=30').then(alerts => {
+                    if (selectedCameraId === cameraId) renderCameraAlertHistory(alerts);
+                }));
+            }
+            await Promise.all(tasks);
+        })().catch(function(error) {
+            if (error.status !== 401) console.warn('Camera data refresh failed:', error.message);
+        }).finally(function() {
+            cameraPageRefreshPromise = null;
+        });
+        return cameraPageRefreshPromise;
+    }
+
+    function handleInspectorFrameLoad(image) {
+        if (Number(image.dataset.cameraId) !== selectedCameraId) return;
+        document.getElementById('frame-state').textContent = 'кадр ONVIF';
+        try {
+            const assessment = CameraLensMath.analyzeImage(image);
+            setLensAssessment(assessment, 'По показанному кадру');
+        } catch (_) {
+            const evidence = document.getElementById('metric-lens-evidence');
+            if (evidence) evidence.textContent = 'Анализ пикселей недоступен';
+        }
+    }
+
+    function handleInspectorFrameError() {
+        delete document.getElementById('inspector-frame-image').dataset.version;
+        document.getElementById('inspector-frame-image').hidden = true;
+        document.getElementById('inspector-frame-empty').hidden = false;
+        document.getElementById('frame-state').textContent = 'нет кадра';
+    }
+
+    async function checkCurrentCamera(button) {
+        if (!selectedCameraId) return;
+        const label = button.textContent;
+        button.disabled = true; button.textContent = 'Проверка...';
+        try {
+            await apiFetch('/api/cameras/' + selectedCameraId + '/health/check', { method: 'POST' });
+            showToast('Данные камеры обновлены', 'success');
+            window.refreshVisibleData('manual-check', ['cameras'], [selectedCameraId]);
+        } catch (error) { showToast(error.message, 'error'); }
+        finally { button.disabled = false; button.textContent = label; }
+    }
+
+    function syncAutomaticChecksButton(button, enabled) {
+        syncRegistryCheckCycle(document.querySelector('[data-camera-row="' + selectedCameraId + '"]'), enabled);
+        if (!button) {
+            renderIcons();
+            return;
+        }
+        button.dataset.enabled = String(enabled);
+        button.setAttribute('aria-pressed', String(enabled));
+        button.classList.toggle('btn-secondary', enabled);
+        button.classList.toggle('btn-success', !enabled);
+        button.title = enabled
+            ? 'Камера участвует в автоматическом цикле. Нажмите, чтобы исключить.'
+            : 'Камера исключена из автоматического цикла. Нажмите, чтобы вернуть.';
+        button.innerHTML = enabled
+            ? '<i data-lucide="circle-pause"></i><span>Исключить из проверок</span>'
+            : '<i data-lucide="circle-play"></i><span>Добавить в проверки</span>';
+        button.disabled = false;
+        renderIcons();
+    }
+
+    function syncRegistryCheckCycle(row, enabled) {
+        if (!row) return;
+        row.dataset.automaticChecksEnabled = String(enabled);
+        const state = row.querySelector('[data-check-cycle-state]');
+        if (!state) return;
+        state.className = 'camera-check-cycle-state ' + (enabled ? 'enabled' : 'excluded');
+        state.innerHTML = enabled
+            ? '<i data-lucide="refresh-cw"></i><span>В цикле проверок</span>'
+            : '<i data-lucide="circle-pause"></i><span>Исключена из проверок</span>';
+    }
+
+    async function toggleAutomaticChecks(button) {
+        if (!selectedCameraId || button.disabled) return;
+        const cameraId = selectedCameraId;
+        const wasEnabled = button.dataset.enabled === 'true';
+        button.disabled = true;
+        button.innerHTML = '<i data-lucide="loader-circle" class="icon-spin"></i><span>Сохраняем...</span>';
+        renderIcons();
+
+        try {
+            const result = await apiFetch('/api/health/queue/' + cameraId + '/automatic-checks', {
+                method: 'PATCH',
+                body: { enabled: !wasEnabled }
+            });
+            if (selectedCameraId === cameraId)
+                syncAutomaticChecksButton(button, result.automaticChecksEnabled);
+            showToast(result.message, 'success');
+            window.refreshVisibleData('automatic-checks', ['cameras', 'registry', 'queue'], [cameraId]);
+        } catch (error) {
+            if (selectedCameraId === cameraId)
+                syncAutomaticChecksButton(button, wasEnabled);
+            showToast(error.message, 'error');
+        }
+    }
+
+    function setCameraEditorStatus(message, tone) {
+        const status = document.getElementById('camera-editor-status');
+        status.textContent = message || '';
+        status.className = 'camera-settings-status' + (tone ? ' ' + tone : '');
+    }
+
+    function tagsForEditor(value) {
+        if (!value || value === '[]') return '';
+        try {
+            const tags = JSON.parse(value);
+            return Array.isArray(tags) ? tags.join(', ') : String(value);
+        } catch (_) { return String(value); }
+    }
+
+    function tagsForSave(value) {
+        const source = String(value || '').trim();
+        if (!source) return '[]';
+        try {
+            const tags = JSON.parse(source);
+            if (Array.isArray(tags)) return JSON.stringify(tags.map(String).map(x => x.trim()).filter(Boolean));
+        } catch (_) { }
+        return JSON.stringify(source.split(',').map(x => x.trim()).filter(Boolean));
+    }
+
+    async function openCameraEditor(id) {
+        const editorRequest = ++cameraLocationRequest;
+        editingCameraId = Number(id) || null;
+        editingCameraHasCredentials = false;
+        const form = document.getElementById('camera-settings-form');
+        const button = document.getElementById('save-camera-button');
+        const credentialsState = document.getElementById('camera-credentials-state');
+        form.reset();
+        document.getElementById('camera-location-status').textContent = '';
+        document.getElementById('camera-location-lookup').disabled = false;
+        document.getElementById('camera-id').value = editingCameraId || '';
+        document.getElementById('camera-editor-title').textContent = editingCameraId ? 'Настроить камеру' : 'Добавить камеру';
+        document.getElementById('camera-password').placeholder = editingCameraId ? 'Не менять' : 'Введите пароль';
+        credentialsState.textContent = 'Не настроен';
+        credentialsState.className = 'settings-state';
+        setCameraEditorStatus('');
+
+        const modal = document.getElementById('camera-editor');
+        modal.hidden = false;
+        document.body.classList.add('modal-open');
+        if (!editingCameraId) { document.getElementById('camera-name').focus(); return; }
+
+        button.disabled = true;
+        setCameraEditorStatus('Загрузка настроек...');
+        try {
+            const settings = await apiFetch('/api/cameras/' + editingCameraId + '/settings');
+            if (editorRequest !== cameraLocationRequest || modal.hidden) return;
+            document.getElementById('camera-name').value = settings.name || '';
+            document.getElementById('camera-ip').value = settings.ipAddress || '';
+            document.getElementById('camera-port').value = settings.port || 80;
+            document.getElementById('camera-url').value = settings.serviceUrl || '';
+            document.getElementById('camera-user').value = settings.username || '';
+            document.getElementById('camera-auth-type').value = settings.authType || 'wsse';
+            document.getElementById('camera-interval').value = settings.checkIntervalSeconds || 3600;
+            document.getElementById('camera-auto-backup').checked = Boolean(settings.autoBackup);
+            document.getElementById('camera-auto-recovery').checked = Boolean(settings.autoRecovery);
+            document.getElementById('camera-tags').value = tagsForEditor(settings.tags);
+            document.getElementById('camera-notes').value = settings.notes || '';
+            document.getElementById('camera-latitude').value = settings.location?.latitude ?? '';
+            document.getElementById('camera-longitude').value = settings.location?.longitude ?? '';
+            document.getElementById('camera-street-address').value = settings.location?.streetAddress || '';
+            editingCameraHasCredentials = Boolean(settings.hasCredentials);
+            credentialsState.textContent = editingCameraHasCredentials ? 'Доступ сохранён' : 'Не настроен';
+            credentialsState.classList.toggle('configured', editingCameraHasCredentials);
+            setCameraEditorStatus('');
+            document.getElementById('camera-name').focus();
+        } catch (error) {
+            closeCameraEditor();
+            showToast(error.message, 'error');
+        } finally { button.disabled = false; }
+    }
+
+    function closeCameraEditor() { ++cameraLocationRequest; const modal = document.getElementById('camera-editor'); if (modal) modal.hidden = true; document.body.classList.remove('modal-open'); }
+
+    function cameraCoordinatesChanged() {
+        ++cameraLocationRequest;
+        document.getElementById('camera-street-address').value = '';
+        document.getElementById('camera-location-status').textContent = '';
+        document.getElementById('camera-location-lookup').disabled = false;
+    }
+
+    function cameraLocationInput() {
+        const latitude = document.getElementById('camera-latitude').value;
+        const longitude = document.getElementById('camera-longitude').value;
+        return { latitude: latitude === '' ? null : Number(latitude), longitude: longitude === '' ? null : Number(longitude),
+            streetAddress: document.getElementById('camera-street-address').value.trim() };
+    }
+
+    async function resolveCameraStreet() {
+        const location = cameraLocationInput();
+        const status = document.getElementById('camera-location-status');
+        if (location.latitude == null || location.longitude == null || !Number.isFinite(location.latitude) || !Number.isFinite(location.longitude) || Math.abs(location.latitude) > 90 || Math.abs(location.longitude) > 180) {
+            status.textContent = 'Укажите широту от -90 до 90 и долготу от -180 до 180.';
+            return;
+        }
+        const request = ++cameraLocationRequest;
+        const button = document.getElementById('camera-location-lookup');
+        const address = document.getElementById('camera-street-address');
+        button.disabled = true;
+        status.textContent = 'Определяем улицу...';
+        try {
+            const result = await apiFetch('/api/cameras/location/resolve', { method: 'POST', body: location });
+            if (request !== cameraLocationRequest || document.getElementById('camera-editor').hidden) return;
+            if (address.value.trim() === location.streetAddress) address.value = result.streetAddress;
+            status.textContent = 'Адрес найден. Сохраните настройки камеры.';
+        } catch (error) {
+            if (request === cameraLocationRequest && !document.getElementById('camera-editor').hidden) status.textContent = error.message;
+        } finally { if (request === cameraLocationRequest) button.disabled = false; }
+    }
+
+    async function saveCamera() {
+        const form = document.getElementById('camera-settings-form');
+        if (!form.reportValidity()) return;
+        const name = document.getElementById('camera-name').value.trim();
+        const ipAddress = document.getElementById('camera-ip').value.trim();
+        const port = Number(document.getElementById('camera-port').value) || 80;
+        const username = document.getElementById('camera-user').value.trim();
+        const password = document.getElementById('camera-password').value;
+        const checkIntervalSeconds = Number(document.getElementById('camera-interval').value);
+        const button = document.getElementById('save-camera-button');
+        if (!name || !ipAddress) { setCameraEditorStatus('Название и IP-адрес обязательны', 'error'); return; }
+        const location = cameraLocationInput();
+        if ((location.latitude == null) !== (location.longitude == null)) { setCameraEditorStatus('Укажите широту и долготу вместе.', 'error'); return; }
+        if (!editingCameraId && Boolean(username) !== Boolean(password)) { setCameraEditorStatus('Для новой камеры укажите имя пользователя и пароль вместе', 'error'); return; }
+        if (editingCameraId && editingCameraHasCredentials && !username) { setCameraEditorStatus('Укажите имя пользователя для сохранённых учётных данных', 'error'); return; }
+        if (editingCameraId && !editingCameraHasCredentials && Boolean(username) !== Boolean(password)) { setCameraEditorStatus('Для новых учётных данных укажите имя пользователя и пароль вместе', 'error'); return; }
+
+        button.disabled = true;
+        setCameraEditorStatus('Сохраняем...');
+        try {
+            const serviceUrl = document.getElementById('camera-url').value.trim() || ('http://' + ipAddress + ':' + port + '/onvif/device_service');
+            const payload = {
+                name, ipAddress, port, serviceUrl, location,
+                notes: document.getElementById('camera-notes').value.trim(),
+                tags: tagsForSave(document.getElementById('camera-tags').value),
+                autoBackup: document.getElementById('camera-auto-backup').checked,
+                autoRecovery: document.getElementById('camera-auto-recovery').checked,
+                checkIntervalSeconds
+            };
+            const camera = editingCameraId
+                ? await apiFetch('/api/cameras/' + editingCameraId, { method: 'PUT', body: payload })
+                : await apiFetch('/api/cameras', { method: 'POST', body: Object.assign(payload, { username: username || null, password: password || null, authType: document.getElementById('camera-auth-type').value }) });
+            if (editingCameraId && (editingCameraHasCredentials || username || password)) {
+                await apiFetch('/api/cameras/' + editingCameraId + '/credentials', { method: 'PATCH', body: { username, password: password || null, authType: document.getElementById('camera-auth-type').value } });
+            }
+
+            closeCameraEditor();
+            showToast(editingCameraId ? 'Настройки камеры сохранены' : 'Камера добавлена', 'success');
+            if (!editingCameraId) {
+                await refreshCameraRegistry();
+                await selectCamera(camera.id);
+                return;
+            }
+            const row = document.querySelector('[data-camera-row="' + camera.id + '"]');
+            const rowName = row?.querySelector('td:nth-child(3) strong');
+            const rowIp = row?.querySelector('td:nth-child(4) code');
+            if (rowName) rowName.textContent = camera.name;
+            if (rowIp) rowIp.textContent = camera.ipAddress || '—';
+            const rowLocation = row?.querySelector('[data-camera-location]');
+            if (rowLocation) rowLocation.textContent = camera.streetAddress || 'Локация не указана';
+            await selectCamera(camera.id);
+        } catch (error) { setCameraEditorStatus(error.message, 'error'); }
+        finally { button.disabled = false; }
+    }
+
+    function applyFilters() {
+        const query = new URLSearchParams(); const search = document.getElementById('camera-search').value.trim(); const status = document.getElementById('camera-status').value;
+        if (search) query.set('search', search); if (status) query.set('status', status);
+        query.set('perPage', document.getElementById('camera-page-size').value);
+        location.href = '/Cameras' + (query.toString() ? '?' + query : '');
+    }
+
+    function changeCameraPageSize(value) {
+        const url = new URL(location.href);
+        url.searchParams.set('perPage', value);
+        url.searchParams.set('page', '1');
+        location.href = url;
+    }
+
+    function getSelectedIds() { return [...document.querySelectorAll('.camera-checkbox:checked')].map(input => Number(input.value)); }
+    function updateSelection() { const ids = getSelectedIds(); document.getElementById('bulk-actions').hidden = ids.length === 0; document.getElementById('selected-count').textContent = ids.length + ' выбрано'; }
+    function toggleSelectAll(input) { document.querySelectorAll('.camera-checkbox').forEach(box => box.checked = input.checked); updateSelection(); }
+    function clearSelection() { document.querySelectorAll('.camera-checkbox').forEach(box => box.checked = false); const all = document.getElementById('select-all'); if (all) all.checked = false; updateSelection(); }
+
+    async function checkIds(ids) {
+        let cursor = 0, completed = 0, failed = 0; const workerCount = Math.min(cameraCheckConcurrency, ids.length);
+        const progress = document.getElementById('check-progress');
+        async function worker() {
+            while (cursor < ids.length) {
+                const id = ids[cursor++];
+                const row = document.querySelector('[data-camera-row="' + id + '"]');
+                if (row) row.style.opacity = '.55';
+                try { await apiFetch('/api/cameras/' + id + '/health/check', { method: 'POST' }); completed++; }
+                catch (_) { failed++; }
+                if (row) row.style.opacity = '';
+                if (progress) progress.textContent = (completed + failed) + ' / ' + ids.length + ' · ошибок: ' + failed;
+            }
+        }
+        await Promise.all(Array.from({ length: workerCount }, worker));
+        showToast('Проверка завершена: ' + completed + ' успешно, ' + failed + ' ошибок', failed ? 'warning' : 'success');
+        await refreshCameraPageData();
+    }
+    function checkSelectedCameras() { const ids = getSelectedIds(); if (ids.length) checkIds(ids); }
+    function checkVisibleCameras() { const ids = [...document.querySelectorAll('[data-camera-row]')].map(row => Number(row.dataset.cameraRow)); if (ids.length) checkIds(ids); }
+
+    async function deleteCamera(id) {
+        const row = document.querySelector('[data-camera-row="' + id + '"]');
+        const name = row?.querySelector('td:nth-child(3) strong')?.textContent || ('ID ' + id);
+        if (!confirm('Удалить камеру «' + name + '» и историю её проверок?')) return;
+        try { await apiFetch('/api/cameras/' + id, { method: 'DELETE' }); showToast('Камера удалена', 'success'); window.refreshVisibleData('deleted', ['cameras', 'registry', 'alerts', 'navigation']); }
+        catch (error) { showToast(error.message, 'error'); }
+    }
+    async function startDiscovery() {
+        try { showToast('Ищем ONVIF-устройства в сети...', 'info'); const result = await apiFetch('/api/discovery/scan', { method: 'POST', body: { scanType: 'ws_discovery' } }); showToast('Найдено: ' + (result.camerasFound || 0) + ', добавлено: ' + (result.camerasAdded || 0), 'success'); setTimeout(() => location.reload(), 900); }
+        catch (error) { showToast(error.message, 'error'); }
+    }
+</script>
+}
+
+@functions {
+    private static string StatusClass(CameraStatus status) => status switch { CameraStatus.Online => "online", CameraStatus.Suspect => "suspect", CameraStatus.Offline => "offline", _ => "unknown" };
+    private static string StatusText(CameraStatus status) => status switch { CameraStatus.Online => "Онлайн", CameraStatus.Suspect => "Проверить", CameraStatus.Offline => "Офлайн", _ => "Нет данных" };
+    private static string DeviceLabel(Camera camera) { var value = ((camera.Manufacturer ?? "") + " " + (camera.Model ?? "")).Trim(); return string.IsNullOrWhiteSpace(value) ? "ONVIF-устройство" : value; }
+    private static string Tashkent(DateTime value) { var utc = value.Kind == DateTimeKind.Utc ? value : DateTime.SpecifyKind(value, DateTimeKind.Utc); var id = TimeZoneInfo.GetSystemTimeZones().Any(x => x.Id == "Asia/Tashkent") ? "Asia/Tashkent" : "West Asia Standard Time"; return TimeZoneInfo.ConvertTimeFromUtc(utc, TimeZoneInfo.FindSystemTimeZoneById(id)).ToString("dd.MM.yyyy HH:mm:ss"); }
+}

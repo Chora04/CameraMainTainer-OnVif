@@ -1,0 +1,1134 @@
+@page "/Cameras/Detail/{id:int}"
+@attribute [Microsoft.AspNetCore.Authorization.Authorize(Policy = CameraMaintainer.Web.Security.AccessPolicies.ViewCameras)]
+@using CameraMaintainer.Core.Interfaces
+@using CameraMaintainer.Core.Models
+@using CameraMaintainer.Web.Security
+@inject ICameraRepository CameraRepo
+@inject IHealthService HealthService
+@inject ICameraFrameArchiveService FrameArchiveService
+
+@{
+    ViewData["Title"] = "Детали камеры";
+    var cameraId = int.TryParse(RouteData.Values["id"]?.ToString(), out var id) ? id : 0;
+    var camera = await CameraRepo.GetByIdAsync(cameraId);
+    if (camera == null)
+    {
+        <div class="empty-state">
+            <h2>Камера не найдена</h2>
+            <p>Камера с ID @cameraId не существует или была удалена.</p>
+            <a href="/Cameras" class="btn btn-primary" style="margin-top:16px;display:inline-block;">← Вернуться к списку</a>
+        </div>
+        return;
+    }
+    var currentHealth = await HealthService.GetCurrentHealthAsync(camera.Id);
+    var frameRecords = await FrameArchiveService.GetRecentAsync(camera.Id, HttpContext.RequestAborted);
+    string FrameDirection(string status) => status switch
+    {
+        "Normal" => "Норма",
+        "DarkScene" => "Слишком темно",
+        "Overexposed" => "Сильная засветка",
+        "WallObstructed" => "Объектив перекрыт",
+        "PartiallyObstructed" => "Обзор частично перекрыт",
+        _ => "Требуется проверка"
+    };
+    string FrameReason(CameraFrameRecord record)
+    {
+        var codes = record.TriggerCodes.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (codes.Contains("obstruction")) return FrameDirection(record.DirectionStatus);
+        if (codes.Contains("brightness_low")) return "Яркость ниже нормы";
+        if (codes.Contains("brightness_high")) return "Яркость выше нормы";
+        if (codes.Contains("contrast_low")) return "Недостаточный контраст";
+        if (codes.Contains("entropy_low")) return "Недостаточно деталей";
+        if (codes.Contains("direction")) return FrameDirection(record.DirectionStatus);
+        return "Показатели в норме";
+    }
+    var canRunChecks = User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.RunChecks);
+    var canManageCameras = User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.ManageCameras);
+    var canViewMaintenance = User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.ViewMaintenance);
+    var canManageMaintenance = canManageCameras && canViewMaintenance;
+}
+
+<div class="top-bar">
+    <div class="top-bar-left">
+        <a href="/Cameras" class="back-link"><i data-lucide="arrow-left"></i> К списку камер</a>
+        <h2 class="page-title">@camera.Name</h2>
+        @{
+            var statusClass = camera.Status.ToString().ToLower();
+            var statusText = camera.Status switch
+            {
+                CameraMaintainer.Core.Enums.CameraStatus.Online => "Онлайн",
+                CameraMaintainer.Core.Enums.CameraStatus.Offline => "Офлайн",
+                CameraMaintainer.Core.Enums.CameraStatus.Suspect => "Подозрение",
+                CameraMaintainer.Core.Enums.CameraStatus.Unknown => "Неизвестно",
+                _ => camera.Status.ToString()
+            };
+        }
+        <span class="badge badge-@statusClass">@statusText</span>
+    </div>
+    <div class="top-bar-right">
+        @if (canManageMaintenance)
+        {
+            <button class="btn camera-cycle-toggle @(camera.AutomaticChecksEnabled ? "btn-secondary" : "btn-success")"
+                    id="detail-cycle-toggle" type="button"
+                    data-enabled="@(camera.AutomaticChecksEnabled ? "true" : "false")"
+                    aria-pressed="@(camera.AutomaticChecksEnabled ? "true" : "false")"
+                    onclick="toggleCameraCheckCycle(@camera.Id, this)">
+                <i data-lucide="@(camera.AutomaticChecksEnabled ? "circle-pause" : "circle-play")"></i>
+                <span>@(camera.AutomaticChecksEnabled ? "Исключить из проверок" : "Добавить в проверки")</span>
+            </button>
+        }
+        @if (canRunChecks)
+        {
+            <button class="btn btn-primary" onclick="checkNow(@camera.Id, this)"><i data-lucide="refresh-cw"></i> Проверить сейчас</button>
+        }
+    </div>
+</div>
+
+<div class="tabs">
+    <button class="tab active" data-tab-target="overview" onclick="showTab('overview', this)">Обзор</button>
+    @if (canManageCameras)
+    {
+        <button class="tab" data-tab-target="ptz" onclick="showTab('ptz', this)">PTZ Управление</button>
+        <button class="tab" data-tab-target="config" onclick="showTab('config', this)">Конфигурация</button>
+    }
+    @if (canViewMaintenance)
+    {
+        <button class="tab" data-tab-target="maintenance" onclick="showTab('maintenance', this)">Обслуживание</button>
+    }
+    <button class="tab" data-tab-target="health" onclick="showTab('health', this)">Текущая проверка</button>
+</div>
+
+<!-- ==================== OVERVIEW TAB ==================== -->
+<div id="tab-overview" class="tab-content active">
+    <div class="detail-grid">
+        <div class="detail-card">
+            <h4>Информация об устройстве</h4>
+            <dl>
+                <dt>Производитель</dt>
+                <dd>@(camera.Manufacturer ?? "—")</dd>
+                <dt>Модель</dt>
+                <dd>@(camera.Model ?? "—")</dd>
+                <dt>Серийный номер</dt>
+                <dd>@(camera.SerialNumber ?? "—")</dd>
+                <dt>Прошивка</dt>
+                <dd>@(camera.FirmwareVersion ?? "—")</dd>
+            </dl>
+        </div>
+        <div class="detail-card">
+            <h4>Сеть</h4>
+            <dl>
+                <dt>IP-адрес</dt>
+                <dd>@(camera.IpAddress ?? "—")</dd>
+                <dt>Порт</dt>
+                <dd>@camera.Port</dd>
+                <dt>Широта</dt><dd>@(camera.Latitude?.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture) ?? "Не указана")</dd>
+                <dt>Долгота</dt><dd>@(camera.Longitude?.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture) ?? "Не указана")</dd>
+                <dt>Улица / адрес · <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap</a></dt><dd>@(camera.StreetAddress ?? "Не указан")</dd>
+                <dt>Сервисный URL</dt>
+                <dd><code>@camera.ServiceUrl</code></dd>
+                @if (!string.IsNullOrEmpty(camera.IpAddress))
+                {
+                    <dt>MAC-адрес</dt>
+                    <dd>@(camera.CapabilitiesRaw?.Contains("MAC") == true ? "См. capabilities" : "—")</dd>
+                }
+            </dl>
+        </div>
+        <div class="detail-card">
+            <h4>Статус</h4>
+            <dl>
+                <dt>Текущий статус</dt>
+                <dd><span class="badge badge-@statusClass">@statusText</span></dd>
+                <dt>Последняя активность</dt>
+                <dd>@(camera.LastSeenAt.HasValue ? Tashkent(camera.LastSeenAt.Value) : "Никогда")</dd>
+                <dt>Последняя проверка</dt>
+                <dd>@(camera.LastCheckAt.HasValue ? Tashkent(camera.LastCheckAt.Value) : "Никогда")</dd>
+                <dt>Последовательных сбоев</dt>
+                <dd>@camera.ConsecutiveFailures</dd>
+                <dt>Время работы</dt>
+                <dd>@(camera.UptimeSeconds.HasValue ? $"{(camera.UptimeSeconds.Value / 3600)} ч {(camera.UptimeSeconds.Value % 3600 / 60)} мин" : "—")</dd>
+            </dl>
+        </div>
+        <div class="detail-card">
+            <h4>Авто-настройки</h4>
+            <dl>
+                <dt>Авто-резервное копирование</dt>
+                <dd>
+                    <span id="auto-backup-badge">@(camera.AutoBackup ? "Включено" : "Отключено")</span>
+                    @if (canManageCameras)
+                    {
+                    <button class="btn btn-sm" style="margin-left:8px;"
+                            onclick="toggleAutoSetting(@camera.Id, 'backup', @(camera.AutoBackup ? "false" : "true"), this)">
+                        @(camera.AutoBackup ? "Отключить" : "Включить")
+                    </button>
+                    }
+                </dd>
+                <dt>Авто-восстановление</dt>
+                <dd>
+                    <span id="auto-recovery-badge">@(camera.AutoRecovery ? "Включено" : "Отключено")</span>
+                    @if (canManageCameras)
+                    {
+                    <button class="btn btn-sm" style="margin-left:8px;"
+                            onclick="toggleAutoSetting(@camera.Id, 'recovery', @(camera.AutoRecovery ? "false" : "true"), this)">
+                        @(camera.AutoRecovery ? "Отключить" : "Включить")
+                    </button>
+                    }
+                </dd>
+                <dt>Интервал проверки</dt>
+                <dd>@camera.CheckIntervalSeconds сек</dd>
+                <dt>Автоматические проверки</dt>
+                <dd><strong id="automatic-checks-state">@(camera.AutomaticChecksEnabled ? "Камера в цикле" : "Камера исключена из цикла")</strong></dd>
+            </dl>
+        </div>
+    </div>
+
+    <div class="detail-card" style="margin-bottom:24px;">
+        <h4>Возможности</h4>
+        <dl style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+            <div>
+                <dt>PTZ</dt>
+                <dd>@(camera.PtzSupported ? "Поддерживается" : "Не поддерживается")</dd>
+            </div>
+            <div>
+                <dt>События</dt>
+                <dd>@(camera.EventsSupported ? "Поддерживаются" : "Не поддерживаются")</dd>
+            </div>
+            <div>
+                <dt>Температура</dt>
+                <dd>@(camera.TemperatureC.HasValue ? $"{camera.TemperatureC.Value:F1}°C" : "—")</dd>
+            </div>
+            <div>
+                <dt>Создана</dt>
+                <dd>@Tashkent(camera.CreatedAt)</dd>
+            </div>
+        </dl>
+    </div>
+
+    @{
+        var latestHealth = currentHealth;
+        System.Text.Json.JsonElement detail = default;
+        var hasDetail = latestHealth != null &&
+            !string.IsNullOrEmpty(latestHealth.DetailJson) &&
+            latestHealth.DetailJson != "{}";
+
+        if (hasDetail)
+        {
+            try { detail = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(latestHealth!.DetailJson); }
+            catch { hasDetail = false; }
+        }
+
+        // Helper: try get value from JSON, fall back to old field name
+        double GetDouble(string newKey, string oldKey) {
+            if (hasDetail && detail.TryGetProperty(newKey, out var v) && v.TryGetDouble(out var value)) return value;
+            if (hasDetail && detail.TryGetProperty(oldKey, out var ov) && ov.TryGetDouble(out var oldValue)) return oldValue;
+            return 0;
+        }
+        string GetStr(string newKey, string oldKey) {
+            if (hasDetail && detail.TryGetProperty(newKey, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.String) return v.GetString() ?? "";
+            if (hasDetail && detail.TryGetProperty(oldKey, out var ov) && ov.ValueKind == System.Text.Json.JsonValueKind.String) return ov.GetString() ?? "";
+            return "";
+        }
+        long GetLong(string newKey, string oldKey) {
+            if (hasDetail && detail.TryGetProperty(newKey, out var v) && v.TryGetInt64(out var value)) return value;
+            if (hasDetail && detail.TryGetProperty(oldKey, out var ov) && ov.TryGetInt64(out var oldValue)) return oldValue;
+            return 0;
+        }
+        bool GetBool(string key) {
+            return hasDetail && detail.TryGetProperty(key, out var value) &&
+                value.ValueKind is System.Text.Json.JsonValueKind.True or System.Text.Json.JsonValueKind.False &&
+                value.GetBoolean();
+        }
+        var pingAvgMs     = GetDouble("PingAvgMs", "PingMs");
+        var pingOkOld     = hasDetail && detail.TryGetProperty("PingOk", out var po) && po.GetBoolean();
+        var pingOk        = pingAvgMs > 0 || pingOkOld;
+        var jitterMs      = GetDouble("JitterMs", "JitterMs");
+        var packetLoss    = GetDouble("PacketLossPercent", "PacketLossPercent");
+        var timeDrift     = GetDouble("TimeDriftSeconds", "TimeDriftSeconds");
+        var timeDriftOld  = GetDouble("TimeDriftSeconds", "TimeDriftSeconds");
+        var cameraTimeRaw = GetStr("CameraTime", "CameraTime");
+        var cameraTimeText = DateTime.TryParse(cameraTimeRaw, out var parsedCameraTime)
+            ? Tashkent(parsedCameraTime)
+            : "—";
+        var snapshotAvailable = GetBool("SnapshotAvailable") || !string.IsNullOrEmpty(GetStr("SnapshotUrl", "SnapshotUrl"));
+        var meanBrightness = GetDouble("MeanBrightness", "MeanBrightness");
+        var imageVariance  = GetDouble("ImageVariance", "ImageVariance");
+        var imageEntropy   = GetDouble("ImageEntropy", "ImageEntropy");
+        var edgeDensity    = GetDouble("EdgeDensity", "EdgeDensity");
+        var textureUniformity = GetDouble("TextureUniformity", "TextureUniformity");
+        var directionConf  = GetDouble("DirectionConfidence", "DirectionConfidence");
+        var directionStatus = GetStr("DirectionStatus", "DirectionStatus");
+        var snapshotDownloadMs = GetLong("SnapshotDownloadMs", "SnapshotDownloadMs");
+        var snapshotSizeBytes  = GetLong("SnapshotSizeBytes", "SnapshotSizeBytes");
+        var onvifCallCount = (int)GetLong("OnvifCallCount", "OnvifCallCount");
+        var onvifTotalMs   = GetLong("OnvifTotalResponseMs", "OnvifTotalResponseMs");
+        var snapshotProxyUrl = $"/api/cameras/{camera.Id}/snapshot?v={latestHealth?.CheckedAt.Ticks ?? DateTime.UtcNow.Ticks}";
+        var liveFrameUrl = $"/api/cameras/{camera.Id}/live-frame";
+    }
+
+    <!-- ===== ТЕХНИЧЕСКИЕ ПОКАЗАТЕЛИ ===== -->
+    <h3 style="margin:24px 0 16px 0;font-size:17px;font-weight:600;color:var(--text);">Технические показатели</h3>
+
+    <div class="detail-grid">
+        <div class="detail-card">
+            <h4>Сеть и доступность</h4>
+            <dl>
+                <dt>Пинг</dt>
+                <dd>
+                    @if (!hasDetail || (!pingOk && pingAvgMs <= 0))
+                    { <span style="color:var(--danger-text);">Недоступен</span> }
+                    else if (pingOk)
+                    { <span style="color:var(--online);">Доступен, @(pingAvgMs.ToString("F0")) мс</span> }
+                    else
+                    { <span style="color:var(--danger-text);">Недоступен</span> }
+                </dd>
+                <dt>Ответ ONVIF</dt>
+                <dd>
+                    @if (latestHealth != null)
+                    { <span>@latestHealth.ResponseTimeMs мс, @(latestHealth.Reachable ? "успешно" : latestHealth.StatusCode)</span> }
+                    else
+                    { <span class="text-muted">—</span> }
+                </dd>
+                @if (latestHealth != null && latestHealth.JitterMs.HasValue)
+                { <dt>Джиттер</dt> <dd>@(latestHealth.JitterMs.Value.ToString("F1")) мс</dd> }
+                @if (latestHealth != null && latestHealth.PacketLossPercent.HasValue)
+                { <dt>Потери пакетов</dt> <dd>@(latestHealth.PacketLossPercent.Value.ToString("F1"))%</dd> }
+                <dt>Последняя проверка</dt>
+                <dd>@(latestHealth != null ? Tashkent(latestHealth.CheckedAt) : "—")</dd>
+            </dl>
+        </div>
+        <div class="detail-card">
+            <h4>Дата и время камеры</h4>
+            <dl>
+                <dt>Дата и время камеры</dt>
+                <dd>@cameraTimeText</dd>
+                <dt>Расхождение времени</dt>
+                <dd>
+                    @if (timeDrift > 0 || timeDriftOld > 0)
+                    {
+                        var drift = timeDrift > 0 ? timeDrift : timeDriftOld;
+                        if (drift < 5)
+                        { <span style="color:var(--online);">@(drift.ToString("F1")) сек</span> }
+                        else if (drift < 30)
+                        { <span style="color:var(--warning);">@(drift.ToString("F1")) сек</span> }
+                        else
+                        { <span style="color:var(--danger-text);">@(drift.ToString("F1")) сек</span> }
+                    }
+                    else
+                    { <span class="text-muted">Нет данных</span> }
+                </dd>
+                @if (latestHealth != null && latestHealth.UptimeSeconds.HasValue)
+                {
+                    var uptime = TimeSpan.FromSeconds(latestHealth.UptimeSeconds.Value);
+                    <dt>Время работы</dt>
+                    <dd>@((int)uptime.TotalHours) ч @uptime.Minutes мин</dd>
+                }
+            </dl>
+        </div>
+        <div class="detail-card">
+            <h4>Объектив</h4>
+            <dl>
+                <dt>Состояние</dt>
+                <dd>
+                    @if (!hasDetail || !snapshotAvailable)
+                    { <span class="text-muted">Нет снимка</span> }
+                    else
+                    {
+                        <strong id="detail-lens-state">Расчёт по пикселям...</strong>
+                        <small class="metric-evidence" id="detail-lens-evidence">Ожидание кадра</small>
+                    }
+                </dd>
+                <dt>Направление</dt>
+                <dd>
+                    @{
+                        var directionLabel = directionStatus switch {
+                            "Normal" => "Норма", "WallObstructed" => "Камера направлена в стену",
+                            "PartiallyObstructed" => "Обзор частично перекрыт", "DarkScene" => "Тёмная сцена",
+                            "Overexposed" => "Сильная засветка", _ => "Нет данных"
+                        };
+                    }
+                    <span>@directionLabel</span>
+                    @if (directionConf > 0)
+                    { <span class="text-muted">(увер. @((directionConf * 100).ToString("F0"))%)</span> }
+                </dd>
+                <dt>Плотность граней</dt>
+                <dd>@(edgeDensity > 0 ? edgeDensity.ToString("F1") + "%" : "—")</dd>
+                <dt>Однородность текстуры</dt>
+                <dd>@(textureUniformity > 0 ? textureUniformity.ToString("F1") + "%" : "—")</dd>
+            </dl>
+            @if (camera.PtzSupported && (directionStatus == "WallObstructed" || directionStatus == "PartiallyObstructed"))
+            {
+                <button class="btn btn-warning btn-sm" style="margin-top:8px;"
+                        onclick="autoCorrectPtz(@camera.Id, this)">
+                    <i data-lucide="scan-line"></i> Авто-коррекция PTZ
+                </button>
+            }
+        </div>
+        <div class="detail-card">
+            <h4>Метрики кадра</h4>
+            <dl>
+                <dt>Яркость</dt>
+                <dd>@(hasDetail ? meanBrightness.ToString("F1") : "—")</dd>
+                <dt>Дисперсия</dt>
+                <dd>@(hasDetail ? imageVariance.ToString("F1") : "—")</dd>
+                <dt>Энтропия</dt>
+                <dd>@(hasDetail ? imageEntropy.ToString("F2") : "—")</dd>
+                <dt>Скачивание кадра</dt>
+                <dd>@(snapshotDownloadMs > 0 ? $"{snapshotDownloadMs} мс" : "—")</dd>
+                <dt>Размер кадра</dt>
+                <dd>@(snapshotSizeBytes > 0 ? $"{(snapshotSizeBytes / 1024.0):F1} КБ" : "—")</dd>
+                @if (onvifCallCount > 0)
+                { <dt>ONVIF вызовов</dt> <dd>@onvifCallCount</dd> }
+            </dl>
+        </div>
+        <div class="detail-card">
+            <h4>Последний кадр</h4>
+            @if (hasDetail && snapshotAvailable)
+            {
+                <div class="snapshot-frame">
+                    <img id="detail-snapshot-image" src="@snapshotProxyUrl"
+                         alt="Последний кадр камеры"
+                         class="zoomable"
+                         onload="this.hidden=false;this.nextElementSibling.hidden=true;analyzeDetailLens(this)"
+                         onclick="openImageViewer(this)"
+                         title="Двойной клик или нажатие для увеличения"
+                         onerror="delete this.dataset.version;this.hidden=true;this.nextElementSibling.hidden=false">
+                    <div class="snapshot-empty" hidden>Не удалось загрузить кадр</div>
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;font-size:12px;color:var(--text-3);">
+                    <span>Получен при проверке ONVIF</span>
+                    <a href="@liveFrameUrl" target="_blank" class="text-action" style="color:var(--accent);"><i data-lucide="camera"></i> Живой кадр</a>
+                </div>
+            }
+            else
+            {
+                <div class="snapshot-empty">Нажмите «Проверить сейчас» для получения кадра</div>
+            }
+        </div>
+    </div>
+
+    <section class="frame-history-section" aria-labelledby="frame-history-title">
+        <header class="frame-history-header">
+            <div>
+                <h3 id="frame-history-title">История анализа кадров</h3>
+                <p>Нормальные проверки хранят только показатели. Снимок остаётся на диске при отклонении.</p>
+            </div>
+            <span class="frame-history-count">@frameRecords.Count записей</span>
+        </header>
+        @if (frameRecords.Count == 0)
+        {
+            <div class="frame-history-empty">История появится после следующей успешной проверки кадра.</div>
+        }
+        else
+        {
+            <div class="frame-history-grid">
+                @foreach (var frame in frameRecords)
+                {
+                    <article class="frame-history-item @(frame.IsAnomalous ? "anomaly" : "normal")">
+                        <div class="frame-history-preview">
+                            @if (frame.ImageRelativePath != null)
+                            {
+                                <img src="/api/cameras/@camera.Id/frames/@frame.Id/content"
+                                     alt="Аномальный кадр камеры @camera.Name"
+                                     loading="lazy"
+                                     onclick="openImageViewer(this)">
+                            }
+                            else
+                            {
+                                <div class="frame-history-normal">
+                                    <i data-lucide="check-circle-2"></i>
+                                    <span>Кадр не сохранён</span>
+                                    <small>Показатели в норме</small>
+                                </div>
+                            }
+                        </div>
+                        <div class="frame-history-body">
+                            <div class="frame-history-state">
+                                <strong>@FrameReason(frame)</strong>
+                                <span class="@(frame.IsAnomalous ? "anomaly" : "normal")">@(frame.IsAnomalous ? "Отклонение" : "Норма")</span>
+                            </div>
+                            <time datetime="@frame.CapturedAt.ToString("O")">@Tashkent(frame.CapturedAt)</time>
+                            <dl class="frame-history-metrics">
+                                <div><dt>Яркость</dt><dd>@frame.MeanBrightness.ToString("F1")</dd></div>
+                                <div><dt>Контраст</dt><dd>@frame.BrightnessStdDev.ToString("F1")</dd></div>
+                                <div><dt>Энтропия</dt><dd>@frame.Entropy.ToString("F2")</dd></div>
+                                <div><dt>Контуры</dt><dd>@frame.EdgeDensity.ToString("F1")%</dd></div>
+                            </dl>
+                        </div>
+                    </article>
+                }
+            </div>
+        }
+    </section>
+</div>
+
+<!-- ==================== PTZ CONTROL TAB ==================== -->
+<div id="tab-ptz" class="tab-content" style="display:none;">
+    @if (!camera.PtzSupported)
+    {
+        <div class="empty-state">PTZ не поддерживается этой камерой.</div>
+    }
+    else
+    {
+        <div class="ptz-container">
+            <div>
+                <h4 style="margin-bottom:12px;">Джойстик управления</h4>
+                <div class="ptz-pad">
+                    <button class="ptz-btn ptz-up-left" onmousedown="ptzStart(@camera.Id, -0.5, 0.5)" onmouseup="ptzStop(@camera.Id)" onmouseleave="ptzStop(@camera.Id)" title="Вверх-влево"><i data-lucide="arrow-up-left"></i></button>
+                    <button class="ptz-btn ptz-up" onmousedown="ptzStart(@camera.Id, 0, 0.5)" onmouseup="ptzStop(@camera.Id)" onmouseleave="ptzStop(@camera.Id)" title="Вверх"><i data-lucide="arrow-up"></i></button>
+                    <button class="ptz-btn ptz-up-right" onmousedown="ptzStart(@camera.Id, 0.5, 0.5)" onmouseup="ptzStop(@camera.Id)" onmouseleave="ptzStop(@camera.Id)" title="Вверх-вправо"><i data-lucide="arrow-up-right"></i></button>
+                    <button class="ptz-btn ptz-left" onmousedown="ptzStart(@camera.Id, -0.5, 0)" onmouseup="ptzStop(@camera.Id)" onmouseleave="ptzStop(@camera.Id)" title="Влево"><i data-lucide="arrow-left"></i></button>
+                    <button class="ptz-btn ptz-home" onclick="ptzStop(@camera.Id)" title="Стоп"><i data-lucide="square"></i></button>
+                    <button class="ptz-btn ptz-right" onmousedown="ptzStart(@camera.Id, 0.5, 0)" onmouseup="ptzStop(@camera.Id)" onmouseleave="ptzStop(@camera.Id)" title="Вправо"><i data-lucide="arrow-right"></i></button>
+                    <button class="ptz-btn ptz-down-left" onmousedown="ptzStart(@camera.Id, -0.5, -0.5)" onmouseup="ptzStop(@camera.Id)" onmouseleave="ptzStop(@camera.Id)" title="Вниз-влево"><i data-lucide="arrow-down-left"></i></button>
+                    <button class="ptz-btn ptz-down" onmousedown="ptzStart(@camera.Id, 0, -0.5)" onmouseup="ptzStop(@camera.Id)" onmouseleave="ptzStop(@camera.Id)" title="Вниз"><i data-lucide="arrow-down"></i></button>
+                    <button class="ptz-btn ptz-down-right" onmousedown="ptzStart(@camera.Id, 0.5, -0.5)" onmouseup="ptzStop(@camera.Id)" onmouseleave="ptzStop(@camera.Id)" title="Вниз-вправо"><i data-lucide="arrow-down-right"></i></button>
+                </div>
+                <div style="margin-top:16px;">
+                    <label style="color:var(--text-2);font-size:14px;">Скорость: <span id="speed-value">5</span></label>
+                    <input type="range" id="ptz-speed" min="1" max="10" value="5"
+                           oninput="document.getElementById('speed-value').textContent = this.value"
+                           style="width:100%;margin-top:4px;accent-color:var(--accent);">
+                </div>
+            </div>
+            <div class="ptz-zoom">
+                <h4 style="margin-bottom:12px;">Зум</h4>
+                <button class="btn ptz-btn" style="width:60px;height:60px;font-size:19px;"
+                        onmousedown="ptzZoom(@camera.Id, 0.5)" onmouseup="ptzStop(@camera.Id)" onmouseleave="ptzStop(@camera.Id)"
+                        title="Приблизить"><i data-lucide="zoom-in"></i></button>
+                <button class="btn ptz-btn" style="width:60px;height:60px;font-size:19px;"
+                        onmousedown="ptzZoom(@camera.Id, -0.5)" onmouseup="ptzStop(@camera.Id)" onmouseleave="ptzStop(@camera.Id)"
+                        title="Отдалить"><i data-lucide="zoom-out"></i></button>
+            </div>
+        </div>
+
+        <div class="presets">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                <h4>Предустановки (пресеты)</h4>
+                <button class="btn btn-primary btn-sm" onclick="savePreset(@camera.Id)"><i data-lucide="save"></i> Сохранить текущую позицию</button>
+            </div>
+            <div id="preset-buttons" style="display:flex;flex-wrap:wrap;gap:8px;">
+                Загрузка пресетов...
+            </div>
+        </div>
+    }
+</div>
+
+<!-- ==================== CONFIGURATION TAB ==================== -->
+<div id="tab-config" class="tab-content" style="display:none;">
+    <div class="detail-grid">
+        <div class="detail-card">
+            <h4>Сетевые настройки</h4>
+            <div id="network-config">
+                <p style="color:var(--text-3);">Нажмите «Загрузить» для получения настроек...</p>
+            </div>
+            <div style="margin-top:12px;">
+                <button class="btn btn-primary btn-sm" onclick="loadNetworkConfig(@camera.Id)"><i data-lucide="network"></i> Загрузить сетевые настройки</button>
+            </div>
+        </div>
+        <div class="detail-card">
+            <h4>Пользователи</h4>
+            <div id="users-list">
+                <p style="color:var(--text-3);">Нажмите «Загрузить» для получения списка пользователей...</p>
+            </div>
+            <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
+                <button class="btn btn-sm" onclick="loadUsers(@camera.Id)"><i data-lucide="users"></i> Загрузить пользователей</button>
+            </div>
+        </div>
+        <div class="detail-card">
+            <h4>Синхронизация времени</h4>
+            <p style="color:var(--text-2);margin-bottom:12px;">Синхронизирует время камеры с сервером NTP.</p>
+            <button class="btn btn-primary" onclick="syncTime(@camera.Id, this)"><i data-lucide="clock"></i> Синхронизировать время</button>
+            <div id="sync-result" style="margin-top:8px;"></div>
+        </div>
+        <div class="detail-card">
+            <h4>Профили видео</h4>
+            <div id="media-profiles">
+                <p style="color:var(--text-3);">Нажмите «Загрузить» для получения профилей...</p>
+            </div>
+            <div style="margin-top:12px;">
+                <button class="btn btn-sm" onclick="loadMediaProfiles(@camera.Id)"><i data-lucide="video"></i> Загрузить профили</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ==================== MAINTENANCE TAB ==================== -->
+<div id="tab-maintenance" class="tab-content" style="display:none;">
+    <div class="detail-card" style="margin-bottom:24px;">
+        <h4>Действия по обслуживанию</h4>
+        @if (canManageMaintenance)
+        {
+        <div class="btn-group" style="margin-top:12px;">
+            <button class="btn btn-primary action-btn" onclick="backupConfig(@camera.Id, this)">
+                <i data-lucide="database-backup"></i> Резервное копирование конфигурации
+            </button>
+            <button class="btn btn-warning action-btn" onclick="rebootCamera(@camera.Id)">
+                <i data-lucide="rotate-cw"></i> Перезагрузка
+            </button>
+            <button class="btn btn-danger action-btn" onclick="factoryReset(@camera.Id)">
+                <i data-lucide="triangle-alert"></i> Сброс к заводским настройкам
+            </button>
+        </div>
+        }
+        else
+        {
+            <p class="text-muted">Доступен просмотр резервных копий. Операции изменения отключены администратором.</p>
+        }
+    </div>
+
+    <div class="detail-card">
+        <h4>Резервные копии конфигурации</h4>
+        <div id="backup-items" style="margin-top:12px;">
+            Загрузка...
+        </div>
+    </div>
+</div>
+
+<!-- ==================== CURRENT HEALTH TAB ==================== -->
+<div id="tab-health" class="tab-content" style="display:none;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <h4>Актуальное состояние камеры</h4>
+        <span style="font-size:13px;color:var(--text-3);" id="health-refresh-time"></span>
+    </div>
+    <table class="data-table job-table">
+        <thead>
+            <tr>
+                <th>Время</th>
+                <th>Статус</th>
+                <th>Время отклика</th>
+                <th>Температура</th>
+                <th>Время работы</th>
+                <th>Ошибка</th>
+            </tr>
+        </thead>
+        <tbody id="health-table-body">
+            @if (currentHealth != null)
+            {
+                var h = currentHealth;
+                <tr>
+                    <td>@Tashkent(h.CheckedAt)</td>
+                    <td><span class="badge badge-@(h.Reachable ? "online" : "offline")">@(h.Reachable ? "УСПЕХ" : "СБОЙ")</span></td>
+                    <td>@h.ResponseTimeMs мс</td>
+                    <td>@(h.TemperatureC.HasValue ? $"{h.TemperatureC:F1}°C" : "—")</td>
+                    <td>@(h.UptimeSeconds.HasValue ? $"{(h.UptimeSeconds.Value / 3600)} ч" : "—")</td>
+                    <td>@(string.IsNullOrEmpty(h.ErrorMessage) ? "—" : CameraErrorMessages.Translate(h.ErrorMessage))</td>
+                </tr>
+            }
+            else
+            {
+                <tr>
+                    <td colspan="6" style="text-align:center;color:var(--text-3);">
+                        Проверка камеры ещё не запускалась.
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+</div>
+
+<script>
+    function analyzeDetailLens(image) {
+        if (!window.CameraLensMath) {
+            setTimeout(() => analyzeDetailLens(image), 50);
+            return;
+        }
+
+        const state = document.getElementById('detail-lens-state');
+        const evidence = document.getElementById('detail-lens-evidence');
+        if (!state || !evidence) return;
+
+        try {
+            const assessment = CameraLensMath.analyzeImage(image);
+            state.textContent = assessment.text;
+            state.style.color = assessment.tone === 'danger'
+                ? 'var(--red)'
+                : assessment.tone === 'warning' ? 'var(--yellow)' : 'var(--green)';
+            evidence.textContent = assessment.evidence;
+        } catch (_) {
+            state.textContent = 'Расчёт недоступен';
+            state.style.color = 'var(--text-3)';
+            evidence.textContent = 'Не удалось прочитать пиксели кадра';
+        }
+    }
+
+    // ==================== TAB SWITCHING ====================
+    function showTab(name, trigger) {
+        const canManageCamera = @(canManageCameras ? "true" : "false");
+        const canOpenMaintenance = @(canViewMaintenance ? "true" : "false");
+        if ((name === 'ptz' || name === 'config') && !canManageCamera) return;
+        if (name === 'maintenance' && !canOpenMaintenance) return;
+        document.querySelectorAll('.tab-content').forEach(t => t.style.display = 'none');
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        const tabContent = document.getElementById('tab-' + name);
+        if (tabContent) tabContent.style.display = 'block';
+        (trigger || document.querySelector('[data-tab-target="' + name + '"]'))?.classList.add('active');
+
+        if (name === 'ptz') loadPresets(@camera.Id);
+        if (name === 'maintenance') loadBackups(@camera.Id);
+        if (name === 'health') refreshCurrentHealth(@camera.Id);
+    }
+
+    function setPanelMessage(container, message, color = 'var(--text-3)') {
+        if (!container) return;
+        const paragraph = document.createElement('p');
+        paragraph.style.color = color;
+        paragraph.textContent = message;
+        container.replaceChildren(paragraph);
+    }
+
+    // ==================== HEALTH CHECK ====================
+    function syncDetailCheckCycle(enabled) {
+        const button = document.getElementById('detail-cycle-toggle');
+        const state = document.getElementById('automatic-checks-state');
+        if (state) state.textContent = enabled ? 'Камера в цикле' : 'Камера исключена из цикла';
+        if (!button) return;
+
+        button.dataset.enabled = String(enabled);
+        button.setAttribute('aria-pressed', String(enabled));
+        button.classList.toggle('btn-secondary', enabled);
+        button.classList.toggle('btn-success', !enabled);
+        button.title = enabled
+            ? 'Камера участвует в автоматическом цикле. Нажмите, чтобы исключить.'
+            : 'Камера исключена из автоматического цикла. Нажмите, чтобы вернуть.';
+        button.innerHTML = enabled
+            ? '<i data-lucide="circle-pause"></i><span>Исключить из проверок</span>'
+            : '<i data-lucide="circle-play"></i><span>Добавить в проверки</span>';
+        button.disabled = false;
+        renderIcons();
+    }
+
+    async function toggleCameraCheckCycle(id, button) {
+        if (button.disabled) return;
+        const wasEnabled = button.dataset.enabled === 'true';
+        button.disabled = true;
+        button.innerHTML = '<i data-lucide="loader-circle" class="icon-spin"></i><span>Сохраняем...</span>';
+        renderIcons();
+
+        try {
+            const result = await apiFetch(`/api/health/queue/${id}/automatic-checks`, {
+                method: 'PATCH',
+                body: { enabled: !wasEnabled }
+            });
+            syncDetailCheckCycle(result.automaticChecksEnabled);
+            showToast(result.message, 'success');
+            window.refreshVisibleData('automatic-checks', ['cameras', 'queue'], [Number(id)]);
+        } catch (error) {
+            syncDetailCheckCycle(wasEnabled);
+            showToast(error.message, 'error');
+        }
+    }
+
+    async function checkNow(id, btn) {
+        if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader-circle" class="icon-spin"></i> Проверка...'; renderIcons(); }
+        try {
+            const data = await apiFetch(`/api/cameras/${id}/health/check`, { method: 'POST' });
+            showToast('Проверка завершена: ' + (data.reachable ? 'Камера доступна' : 'Камера недоступна'),
+                data.reachable ? 'success' : 'error');
+            window.refreshVisibleData('manual-check', ['cameras'], [Number(id)]);
+        } catch (error) {
+            showToast('Ошибка проверки: ' + error.message, 'error');
+        } finally {
+            if (btn) { btn.disabled = false; btn.innerHTML = '<i data-lucide="refresh-cw"></i> Проверить сейчас'; renderIcons(); }
+        }
+    }
+
+    // ==================== PTZ FUNCTIONS ====================
+    let ptzInterval = null;
+    let currentPtzCamera = null;
+    let ptzRequestInFlight = false;
+    let ptzErrorShown = false;
+
+    function getSpeed() {
+        const slider = document.getElementById('ptz-speed');
+        return slider ? parseInt(slider.value) / 10 : 0.5;
+    }
+
+    async function sendPtzMove(id, body) {
+        if (ptzRequestInFlight) return;
+        ptzRequestInFlight = true;
+        try {
+            await apiFetch(`/api/cameras/${id}/ptz/move`, { method: 'POST', body });
+        } catch (error) {
+            if (!ptzErrorShown) {
+                ptzErrorShown = true;
+                showToast('Ошибка PTZ: ' + error.message, 'error');
+            }
+        } finally {
+            ptzRequestInFlight = false;
+        }
+    }
+
+    function startPtzRepeater(id, body) {
+        if (ptzInterval) clearInterval(ptzInterval);
+        ptzErrorShown = false;
+        sendPtzMove(id, body);
+        ptzInterval = setInterval(() => sendPtzMove(id, body), 250);
+    }
+
+    function ptzStart(id, pan, tilt) {
+        currentPtzCamera = id;
+        const speed = getSpeed();
+        const body = {
+            profileToken: 'default',
+            pan: pan * speed,
+            tilt: tilt * speed,
+            zoom: 0,
+            mode: 'relative'
+        };
+        startPtzRepeater(id, body);
+    }
+
+    function ptzZoom(id, zoom) {
+        currentPtzCamera = id;
+        const speed = getSpeed();
+        const body = {
+            profileToken: 'default',
+            pan: 0,
+            tilt: 0,
+            zoom: zoom * speed,
+            mode: 'relative'
+        };
+        startPtzRepeater(id, body);
+    }
+
+    function ptzStop(id) {
+        if (ptzInterval) { clearInterval(ptzInterval); ptzInterval = null; }
+        apiFetch(`/api/cameras/${id || currentPtzCamera || @camera.Id}/ptz/stop`, {
+            method: 'POST',
+            body: { profileToken: 'default' }
+        }).catch(error => {
+            if (!ptzErrorShown) showToast('Не удалось остановить PTZ: ' + error.message, 'error');
+        });
+    }
+
+    async function loadPresets(id) {
+        const div = document.getElementById('preset-buttons');
+        if (!div) return;
+        try {
+            const presets = await apiFetch(`/api/cameras/${id}/ptz/presets`);
+            if (!presets || presets.length === 0) {
+                setPanelMessage(div, 'Нет сохранённых пресетов.');
+                return;
+            }
+
+            const buttons = presets.map(preset => {
+                const button = document.createElement('button');
+                button.className = 'btn btn-sm preset-btn';
+                button.type = 'button';
+                button.title = `Перейти к пресету «${preset.presetName || ''}»`;
+                button.innerHTML = '<i data-lucide="map-pin"></i><span></span>';
+                button.querySelector('span').textContent = preset.presetName || 'Без названия';
+                button.addEventListener('click', () => gotoPreset(id, preset.profileToken, preset.presetToken));
+                return button;
+            });
+            div.replaceChildren(...buttons);
+            renderIcons();
+        } catch (error) {
+            setPanelMessage(div, 'Ошибка загрузки пресетов: ' + error.message, 'var(--danger)');
+        }
+    }
+
+    async function gotoPreset(id, profileToken, presetToken) {
+        try {
+            await apiFetch(`/api/cameras/${id}/ptz/goto`, {
+                method: 'POST',
+                body: { profileToken, presetToken }
+            });
+            showToast('Переход к пресету...', 'info');
+        } catch (error) {
+            showToast('Ошибка: ' + error.message, 'error');
+        }
+    }
+
+    async function savePreset(id) {
+        const name = prompt('Введите название для нового пресета:');
+        if (!name || !name.trim()) return;
+        try {
+            await apiFetch(`/api/cameras/${id}/ptz/presets`, {
+                method: 'POST',
+                body: { profileToken: 'default', presetName: name.trim() }
+            });
+            showToast('Пресет «' + name.trim() + '» сохранён', 'success');
+            await loadPresets(id);
+        } catch (error) {
+            showToast('Ошибка сохранения: ' + error.message, 'error');
+        }
+    }
+
+    // ==================== CONFIG FUNCTIONS ====================
+    async function syncTime(id, btn) {
+        if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader-circle" class="icon-spin"></i> Синхронизация...'; renderIcons(); }
+        const result = document.getElementById('sync-result');
+        try {
+            await apiFetch(`/api/cameras/${id}/config/sync-time`, { method: 'POST' });
+            if (result) {
+                result.innerHTML = '<span class="text-action" style="color:var(--success);"><i data-lucide="circle-check"></i><span>Время синхронизировано</span></span>';
+            }
+            renderIcons();
+            showToast('Время камеры синхронизировано', 'success');
+        } catch (error) {
+            setPanelMessage(result, error.message, 'var(--danger)');
+            showToast('Ошибка: ' + error.message, 'error');
+        } finally {
+            if (btn) { btn.disabled = false; btn.innerHTML = '<i data-lucide="clock"></i> Синхронизировать время'; renderIcons(); }
+        }
+    }
+
+    async function loadNetworkConfig(id) {
+        const div = document.getElementById('network-config');
+        setPanelMessage(div, 'Загрузка...');
+        try {
+            const cfg = await apiFetch(`/api/cameras/${id}/config/network`);
+            div.innerHTML = '<dl>' +
+                '<dt>DHCP</dt><dd>' + (cfg.dhcpEnabled ? 'Включён' : 'Отключён') + '</dd>' +
+                '<dt>IP-адрес</dt><dd>' + escapeHtml(cfg.ipAddress || '—') + '</dd>' +
+                '<dt>Маска подсети</dt><dd>' + escapeHtml(cfg.subnetMask || '—') + '</dd>' +
+                '<dt>Шлюз</dt><dd>' + escapeHtml(cfg.defaultGateway || '—') + '</dd>' +
+                '<dt>DNS</dt><dd>' + escapeHtml(cfg.dnsServer || '—') + '</dd>' +
+                '</dl>';
+        } catch (error) {
+            setPanelMessage(div, 'Ошибка: ' + error.message, 'var(--danger)');
+        }
+    }
+
+    async function loadUsers(id) {
+        const div = document.getElementById('users-list');
+        setPanelMessage(div, 'Загрузка...');
+        try {
+            const users = await apiFetch(`/api/cameras/${id}/config/users`);
+            if (!users || users.length === 0) {
+                setPanelMessage(div, 'Нет пользователей.');
+                return;
+            }
+            div.innerHTML = '<table class="data-table"><thead><tr><th>Имя</th><th>Уровень</th><th>Действие</th></tr></thead><tbody>' +
+                users.map(user =>
+                    '<tr>' +
+                    '<td>' + escapeHtml(user.username || '') + '</td>' +
+                    '<td>' + escapeHtml(user.userLevel || '—') + '</td>' +
+                    '<td><button type="button" class="btn btn-sm btn-danger delete-camera-user" data-username="' + escapeHtml(user.username || '') + '"><i data-lucide="trash-2"></i> Удалить</button></td>' +
+                    '</tr>'
+                ).join('') +
+                '</tbody></table>';
+            div.querySelectorAll('.delete-camera-user').forEach(button => {
+                button.addEventListener('click', () => deleteUser(id, button.dataset.username || ''));
+            });
+            renderIcons();
+        } catch (error) {
+            setPanelMessage(div, 'Ошибка: ' + error.message, 'var(--danger)');
+        }
+    }
+
+    function deleteUser(cameraId, username) {
+        showModal('Удаление пользователя',
+                  'Вы уверены, что хотите удалить пользователя «' + username + '»?',
+                  'Удалить',
+                  async function() {
+                      try {
+                          await apiFetch(`/api/cameras/${cameraId}/config/users/${encodeURIComponent(username)}`, { method: 'DELETE' });
+                          showToast('Пользователь «' + username + '» удалён', 'success');
+                          await loadUsers(cameraId);
+                      } catch (error) {
+                          showToast('Ошибка: ' + error.message, 'error');
+                      }
+                  });
+    }
+
+    async function loadMediaProfiles(id) {
+        const div = document.getElementById('media-profiles');
+        setPanelMessage(div, 'Загрузка...');
+        try {
+            const profiles = await apiFetch(`/api/cameras/${id}/config/media-profiles`);
+            if (!profiles || profiles.length === 0) {
+                setPanelMessage(div, 'Нет профилей.');
+                return;
+            }
+            div.innerHTML = profiles.map(profile =>
+                '<div class="backup-item">' +
+                '<span><strong>' + escapeHtml(profile.name || profile.token || 'Без названия') + '</strong> — ' + escapeHtml(profile.videoEncoding || 'нет данных') + '</span>' +
+                '<span style="color:var(--text-3);">' + escapeHtml(profile.resolution || '') + '</span>' +
+                '</div>'
+            ).join('');
+        } catch (error) {
+            setPanelMessage(div, 'Ошибка: ' + error.message, 'var(--danger)');
+        }
+    }
+
+    // ==================== MAINTENANCE FUNCTIONS ====================
+    async function backupConfig(id, btn) {
+        if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader-circle" class="icon-spin"></i> Создание копии...'; renderIcons(); }
+        try {
+            const backup = await apiFetch(`/api/cameras/${id}/maintenance/backup`, { method: 'POST' });
+            const partial = String(backup.backupType || '').endsWith('_partial');
+            showToast(partial ? 'Копия создана частично: не все разделы доступны' : 'Резервная копия создана', partial ? 'warning' : 'success');
+            await loadBackups(id);
+        } catch (error) {
+            showToast('Ошибка: ' + error.message, 'error');
+        } finally {
+            if (btn) { btn.disabled = false; btn.innerHTML = '<i data-lucide="database-backup"></i> Резервное копирование конфигурации'; renderIcons(); }
+        }
+    }
+
+    function rebootCamera(id) {
+        showModal('Перезагрузка камеры',
+                  'Вы уверены, что хотите перезагрузить камеру? Устройство будет недоступно в течение 1-2 минут.',
+                  'Перезагрузить',
+                  async function() {
+                      try {
+                          await apiFetch(`/api/cameras/${id}/maintenance/reboot`, { method: 'POST' });
+                          showToast('Команда перезагрузки отправлена', 'warning');
+                      } catch (error) {
+                          showToast('Ошибка: ' + error.message, 'error');
+                      }
+                  });
+    }
+
+    function factoryReset(id) {
+        showModal('Сброс к заводским настройкам',
+                  'Это действие удалит ВСЕ настройки камеры и вернёт её к заводскому состоянию. ' +
+                  'Это необратимая операция! Вы уверены?',
+                  'Сбросить',
+                  async function() {
+                      try {
+                          await apiFetch(`/api/cameras/${id}/maintenance/factory-reset`, {
+                              method: 'POST',
+                              body: { mode: 'hard' }
+                          });
+                          showToast('Заводской сброс запущен. Камера будет недоступна.', 'error');
+                      } catch (error) {
+                          showToast('Ошибка: ' + error.message, 'error');
+                      }
+                  });
+    }
+
+    async function loadBackups(id) {
+        const div = document.getElementById('backup-items');
+        if (!div) return;
+        setPanelMessage(div, 'Загрузка...');
+        try {
+            const backups = await apiFetch(`/api/cameras/${id}/maintenance/backups`);
+            if (!backups || backups.length === 0) {
+                setPanelMessage(div, 'Нет сохранённых резервных копий.');
+                return;
+            }
+            div.innerHTML = backups.map(backup => {
+                const type = String(backup.backupType || 'full');
+                const partial = type.endsWith('_partial');
+                const label = type.replace('_partial', '') + (partial ? ' (частично)' : '');
+                const createdAt = new Date(backup.createdAt).toLocaleString(window.uiLocale?.intlLocale || 'ru-RU', { timeZone: 'Asia/Tashkent' });
+                return '<div class="backup-item"><div><strong>' + escapeHtml(label) + '</strong> — ' +
+                    escapeHtml(createdAt) + ' (' + escapeHtml(backup.createdBy || 'система') + ')</div></div>';
+            }).join('');
+        } catch (error) {
+            setPanelMessage(div, 'Ошибка загрузки: ' + error.message, 'var(--danger)');
+        }
+    }
+
+    // ==================== AUTO-SETTINGS TOGGLE ====================
+    async function toggleAutoSetting(id, setting, newValue, btn) {
+        const body = setting === 'backup'
+            ? { autoBackup: newValue }
+            : { autoRecovery: newValue };
+
+        if (btn) btn.disabled = true;
+        try {
+            await apiFetch(`/api/cameras/${id}`, { method: 'PUT', body });
+            const badgeId = setting === 'backup' ? 'auto-backup-badge' : 'auto-recovery-badge';
+            const badge = document.getElementById(badgeId);
+            if (badge) {
+                badge.textContent = newValue ? 'Включено' : 'Отключено';
+            }
+            if (btn) btn.textContent = newValue ? 'Отключить' : 'Включить';
+            showToast('Настройка обновлена', 'success');
+            setTimeout(() => location.reload(), 1500);
+        } catch (error) {
+            if (btn) btn.disabled = false;
+            showToast('Ошибка: ' + error.message, 'error');
+        }
+    }
+
+    // ==================== CURRENT HEALTH AUTO-REFRESH ====================
+    function refreshCurrentHealth(id) {
+        return apiFetch(`/api/cameras/${id}/health`)
+            .catch(error => error.status === 404 ? null : Promise.reject(error))
+            .then(h => {
+                if (h) refreshDetailSnapshot(id, h.checkedAt);
+                const tbody = document.getElementById('health-table-body');
+                if (!tbody) return;
+                if (!h) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-3);">Проверка камеры ещё не запускалась.</td></tr>';
+                } else {
+                    tbody.innerHTML =
+                        '<tr>' +
+                        '<td>' + new Date(h.checkedAt).toLocaleTimeString(window.uiLocale?.intlLocale || 'ru-RU', { timeZone: 'Asia/Tashkent' }) + '</td>' +
+                        '<td><span class="badge badge-' + (h.reachable ? 'online' : 'offline') + '">' + (h.reachable ? 'УСПЕХ' : 'СБОЙ') + '</span></td>' +
+                        '<td>' + h.responseTimeMs + ' мс</td>' +
+                        '<td>' + (h.temperatureC != null ? h.temperatureC.toFixed(1) + '°C' : '—') + '</td>' +
+                        '<td>' + (h.uptimeSeconds != null ? Math.floor(h.uptimeSeconds / 3600) + ' ч' : '—') + '</td>' +
+                        '<td>' + escapeHtml(localizeCameraError(h.errorMessage || '—')) + '</td>' +
+                        '</tr>';
+                }
+                const timeEl = document.getElementById('health-refresh-time');
+                if (timeEl) timeEl.textContent = 'Обновлено: ' + new Date().toLocaleTimeString(window.uiLocale?.intlLocale || 'ru-RU', { timeZone: 'Asia/Tashkent' });
+            })
+            .catch(() => {});
+    }
+
+    function refreshDetailSnapshot(id, checkedAt) {
+        const image = document.getElementById('detail-snapshot-image');
+        if (image && image.dataset.version !== checkedAt) {
+            image.dataset.version = checkedAt;
+            image.src = `/api/cameras/${id}/snapshot?v=${encodeURIComponent(checkedAt)}`;
+        }
+    }
+
+    document.addEventListener('camera-maintainer:data-refresh', event => {
+        const detail = event.detail;
+        if (detail.topics.includes('maintenance') && document.getElementById('backup-items'))
+            detail.waitUntil(loadBackups(@camera.Id));
+        if (!detail.topics.includes('cameras') || (detail.cameraIds && !detail.cameraIds.includes(@camera.Id))) return;
+        detail.waitUntil(refreshCameraDetail());
+    });
+
+    async function refreshCameraDetail() {
+        const page = await readLivePage();
+        const next = page.getElementById('tab-overview');
+        if (!next) { window.location.href = '/Cameras'; return; }
+        const current = document.getElementById('tab-overview');
+        const image = document.getElementById('detail-snapshot-image');
+        const nextImage = next.querySelector('#detail-snapshot-image');
+        if (image && nextImage) nextImage.replaceWith(image);
+        current.replaceChildren(...Array.from(next.childNodes));
+        const title = page.querySelector('.top-bar-left');
+        if (title) document.querySelector('.top-bar-left').replaceWith(title);
+        renderIcons();
+        await refreshCurrentHealth(@camera.Id);
+    }
+
+    // ==================== PTZ AUTO-CORRECTION ====================
+    async function autoCorrectPtz(id, btn) {
+        if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader-circle" class="icon-spin"></i> Поиск чистой позиции...'; renderIcons(); }
+        try {
+            const data = await apiFetch(`/api/cameras/${id}/ptz/correct`, { method: 'POST' });
+            showToast('Камера скорректирована: ' + data.description, 'success');
+            setTimeout(() => location.reload(), 2000);
+        } catch (error) {
+            showToast('Ошибка: ' + error.message, 'error');
+            if (btn) { btn.disabled = false; btn.innerHTML = '<i data-lucide="scan-line"></i> Авто-коррекция PTZ'; renderIcons(); }
+        }
+    }
+
+    // ==================== INITIAL LOAD ====================
+    // Preload PTZ data
+    @if (camera.PtzSupported)
+    {
+        <text>loadPresets(@camera.Id);</text>
+    }
+</script>
+
+@functions {
+    private static string Tashkent(DateTime value)
+    {
+        var utc = value.Kind == DateTimeKind.Utc ? value : DateTime.SpecifyKind(value, DateTimeKind.Utc);
+        var id = TimeZoneInfo.GetSystemTimeZones().Any(x => x.Id == "Asia/Tashkent") ? "Asia/Tashkent" : "West Asia Standard Time";
+        return TimeZoneInfo.ConvertTimeFromUtc(utc, TimeZoneInfo.FindSystemTimeZoneById(id)).ToString("dd.MM.yyyy HH:mm:ss");
+    }
+}

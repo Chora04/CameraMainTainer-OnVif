@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+  <resheader name="version"><value>2.0</value></resheader>
+  <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms</value></resheader>
+  <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms</value></resheader>
+  <data name="CameraCheckTimeout" xml:space="preserve">
+    <value>Превышено время ожидания ответа камеры. Проверка не завершилась за отведённое время.</value>
+  </data>
+  <data name="FailureReasonTimeout" xml:space="preserve"><value>Камера не ответила за отведённое время</value></data>
+  <data name="FailureReasonConnectionRefused" xml:space="preserve"><value>Соединение с камерой отклонено</value></data>
+  <data name="FailureReasonAuthFailed" xml:space="preserve"><value>Камера отклонила логин или пароль</value></data>
+  <data name="FailureReasonNotFound" xml:space="preserve"><value>ONVIF-служба камеры не найдена</value></data>
+  <data name="FailureReasonHttpError" xml:space="preserve"><value>Камера вернула ошибку HTTP</value></data>
+  <data name="FailureReasonSoapFault" xml:space="preserve"><value>Камера вернула ошибку ONVIF</value></data>
+  <data name="FailureReasonNoCredentials" xml:space="preserve"><value>Для камеры не указаны данные доступа</value></data>
+  <data name="FailureReasonCredentialsInvalid" xml:space="preserve"><value>Сохранённые данные доступа повреждены</value></data>
+  <data name="FailureReasonCircuitOpen" xml:space="preserve"><value>Проверки временно приостановлены после повторных сбоев</value></data>
+  <data name="FailureReasonUnknown" xml:space="preserve"><value>Проверка завершилась с неизвестной ошибкой</value></data>
+  <data name="FailureStageNetworkProbe" xml:space="preserve"><value>Проверка доступности сети</value></data>
+  <data name="FailureStageDeviceInfo" xml:space="preserve"><value>Получение основных данных ONVIF</value></data>
+  <data name="FailureStageProcessing" xml:space="preserve"><value>Обработка ответа камеры</value></data>
+  <data name="FailureStageFirmware" xml:space="preserve"><value>Сохранение сведений о прошивке</value></data>
+  <data name="FailureStageMetadata" xml:space="preserve"><value>Сохранение данных камеры</value></data>
+  <data name="FailureStageStatus" xml:space="preserve"><value>Обновление состояния камеры</value></data>
+  <data name="FailureStageAlerts" xml:space="preserve"><value>Обработка результатов диагностики</value></data>
+  <data name="FailureStageHealth" xml:space="preserve"><value>Сохранение результата проверки</value></data>
+  <data name="DiagnosisReasonLabel" xml:space="preserve"><value>Причина</value></data>
+  <data name="DiagnosisStageLabel" xml:space="preserve"><value>Этап проверки</value></data>
+  <data name="DiagnosisTimingLabel" xml:space="preserve"><value>Время проверки</value></data>
+  <data name="DiagnosisNextCheckLabel" xml:space="preserve"><value>Результат следующей проверки</value></data>
+  <data name="DiagnosisLegacyStage" xml:space="preserve"><value>Не зафиксирован в старой записи</value></data>
+  <data name="DiagnosisTimeMissing" xml:space="preserve"><value>Точное время не сохранено</value></data>
+  <data name="DiagnosisLegacyTimeout" xml:space="preserve"><value>Лимит ожидания превышен; точное время в старой записи не сохранено</value></data>
+  <data name="DiagnosisTimingWithLimit" xml:space="preserve"><value>{0} при лимите {1}</value></data>
+  <data name="DiagnosisInternalStage" xml:space="preserve"><value>Служебный этап: {0}</value></data>
+  <data name="DiagnosisRecovered" xml:space="preserve"><value>Следующая проверка успешна: {0}. Камера снова отвечает.</value></data>
+  <data name="DiagnosisActive" xml:space="preserve"><value>Ошибка остаётся активной; успешная повторная проверка пока не зафиксирована.</value></data>
+</root>

@@ -1,0 +1,288 @@
+@using CameraMaintainer.Web.Security
+@{
+    var path = Context.Request.Path.Value ?? "/";
+    var alertsPage = path.StartsWith("/Alerts", StringComparison.OrdinalIgnoreCase);
+    var historyActive = alertsPage && Context.Request.Query["view"].ToString().Equals("history", StringComparison.OrdinalIgnoreCase);
+    var alertsActive = alertsPage && !historyActive;
+    var settingsActive = path.StartsWith("/Settings", StringComparison.OrdinalIgnoreCase);
+    var alertCategory = Context.Request.Query["category"].ToString().ToLowerInvariant();
+    var canViewCameras = User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.ViewCameras);
+    var canViewAlerts = User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.ViewAlerts);
+    var canViewAlertHistory = User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.ViewAlertHistory);
+    var canWorkAlerts = canViewAlerts &&
+        User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.RunChecks);
+    var canManageUsers = User.HasClaim(AccessPolicies.PermissionClaim, AccessPolicies.ManageUsers);
+    var isAdministrator = canManageUsers && string.Equals(
+        User.FindFirst(System.Security.Claims.ClaimTypes.Role)?.Value,
+        "Admin",
+        StringComparison.OrdinalIgnoreCase);
+    var displayName = User.FindFirst(System.Security.Claims.ClaimTypes.GivenName)?.Value
+        ?? User.Identity?.Name
+        ?? "Пользователь";
+    var sectionTitle = path.StartsWith("/Cameras", StringComparison.OrdinalIgnoreCase) ? "Камеры" :
+        path.StartsWith("/Alerts", StringComparison.OrdinalIgnoreCase) ? (historyActive ? "История ошибок" : "Ошибки") :
+        path.StartsWith("/Users", StringComparison.OrdinalIgnoreCase) ? "Доступы" :
+        settingsActive ? "Настройки" : "Камеры";
+}
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f0f3f5">
+    <title>@(ViewData["Title"] ?? "Мониторинг камер") | Центр мониторинга камер</title>
+    <script>
+        (() => {
+            try {
+                const savedTheme = localStorage.getItem('cm_theme');
+                const theme = savedTheme === 'dark' || savedTheme === 'light'
+                    ? savedTheme
+                    : (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+                document.documentElement.dataset.theme = theme;
+                document.documentElement.style.colorScheme = theme;
+            } catch (_) {
+                document.documentElement.dataset.theme = 'light';
+            }
+        })();
+    </script>
+    <script src="~/js/localization.js" asp-append-version="true"></script>
+    <link rel="stylesheet" href="~/css/ops-dense.css?rev=voltera-workspace-v2" asp-append-version="true">
+    <script src="~/js/vendor/signalr.min.js" asp-append-version="true"></script>
+</head>
+<body data-access-version="@AccessVersion.For(User)">
+    <script>
+        try {
+            if (window.matchMedia('(min-width: 701px)').matches
+                && localStorage.getItem('cm_sidebar_collapsed') === '1') {
+                document.body.classList.add('sidebar-collapsed');
+            }
+        } catch (_) { }
+    </script>
+    <div class="ops-shell">
+        <div class="sidebar-backdrop" id="sidebar-backdrop" onclick="toggleSidebar(false)"></div>
+        <aside class="ops-rail" id="sidebar">
+            <a class="ops-rail-brand" href="/" aria-label="Camera Maintainer" title="Camera Maintainer"><span class="camera-360-mark" aria-hidden="true"><img src="~/images/camera-360.svg" asp-append-version="true" width="30" height="30" alt=""></span></a>
+
+            <nav class="ops-rail-nav" aria-label="Главное меню">
+                @if (canViewCameras)
+                {
+                    <a class="ops-rail-link @(path.StartsWith("/Cameras", StringComparison.OrdinalIgnoreCase) ? "active" : "")" href="/Cameras" title="Камеры">
+                        <span class="ops-rail-icon"><i data-lucide="cctv"></i></span><span class="ops-rail-label">Камеры</span><b class="nav-count" id="nav-camera-count">—</b>
+                    </a>
+                }
+
+                @if (canViewAlerts)
+                {
+                    <div class="nav-group @(alertsActive ? "open" : "")" id="alerts-nav-group">
+                        <a class="ops-rail-link @(alertsActive ? "active" : "")" href="/Alerts?view=active" title="Все ошибки">
+                            <span class="ops-rail-icon"><i data-lucide="triangle-alert"></i></span><span class="ops-rail-label">Ошибки</span><b class="nav-count alert-count" id="nav-alert-count">—</b>
+                        </a>
+                        <div class="ops-rail-subnav">
+                            <strong>Ошибки</strong>
+                            <a class="@(alertsActive && string.IsNullOrEmpty(alertCategory) ? "active" : "")" href="/Alerts?view=active"><span>Все ошибки</span><b id="nav-all-alert-count">—</b></a>
+                            <a class="@(alertCategory == "physical" ? "active" : "")" href="/Alerts?view=active&category=physical"><span>Физические</span><b id="nav-physical-alert-count">—</b></a>
+                            <a class="@(alertCategory == "technical" ? "active" : "")" href="/Alerts?view=active&category=technical"><span>Технические</span><b id="nav-technical-alert-count">—</b></a>
+                        </div>
+                    </div>
+                }
+
+                @if (canViewAlertHistory)
+                {
+                    <a class="ops-rail-link @(historyActive ? "active" : "")" href="/Alerts?view=history" title="История ошибок">
+                        <span class="ops-rail-icon"><i data-lucide="history"></i></span><span class="ops-rail-label">История</span><b class="nav-count" id="nav-history-alert-count">—</b>
+                    </a>
+                }
+
+                <span class="ops-rail-separator"></span>
+                @if (canManageUsers)
+                {
+                    <a class="ops-rail-link @(path.StartsWith("/Users", StringComparison.OrdinalIgnoreCase) ? "active" : "")" href="/Users" title="Доступы">
+                        <span class="ops-rail-icon"><i data-lucide="users"></i></span><span class="ops-rail-label">Доступы</span>
+                    </a>
+                }
+            </nav>
+
+            <footer class="ops-rail-footer">
+                <a class="ops-rail-link ops-footer-settings @(settingsActive ? "active" : "")" href="/Settings" title="Настройки">
+                    <span class="ops-rail-icon"><i data-lucide="settings"></i></span><span class="ops-rail-label">Настройки</span>
+                </a>
+                <div class="ops-account" title="@displayName">
+                    <span class="avatar">@(displayName.Length > 0 ? displayName[..1].ToUpperInvariant() : "П")</span>
+                    <span class="ops-account-copy"><strong>@displayName</strong></span>
+                    <span class="connection-pill offline" id="live-pill" title="Офлайн" aria-label="Офлайн" aria-live="polite"><i class="status-dot offline" aria-hidden="true"></i><span id="live-label">Офлайн</span></span>
+                </div>
+                <button class="ops-logout-button" type="button" onclick="logout()" aria-label="Выйти из аккаунта" title="Выйти из аккаунта"><span aria-hidden="true"><i data-lucide="log-out"></i></span><strong>Выйти</strong></button>
+            </footer>
+        </aside>
+
+        <div class="ops-main">
+            <header class="ops-topbar">
+                <button class="icon-button mobile-menu-button" id="sidebar-toggle" type="button" onclick="toggleSidebar()" aria-controls="sidebar" aria-expanded="true" aria-label="Открыть или закрыть меню"><i data-lucide="menu"></i></button>
+                <div class="ops-topbar-product"><strong>Camera Maintainer</strong><span>/</span><b>@sectionTitle</b></div>
+                <div class="ops-topbar-status">
+                    <label class="language-switcher" title="Язык интерфейса">
+                        <i data-lucide="languages" aria-hidden="true"></i>
+                        <select data-language-selector onchange="window.uiLocale.setLanguage(this.value)" aria-label="Язык интерфейса">
+                            <option value="ru">Русский</option>
+                            <option value="uz-Latn">O‘zbekcha</option>
+                            <option value="uz-Cyrl">Ўзбекча</option>
+                        </select>
+                    </label>
+                    <button class="icon-button theme-toggle-button" type="button" data-theme-toggle onclick="toggleColorTheme()" aria-label="Включить тёмную тему" title="Включить тёмную тему">
+                        <i class="theme-icon theme-icon-moon" data-lucide="moon"></i>
+                        <i class="theme-icon theme-icon-sun" data-lucide="sun"></i>
+                    </button>
+                    <div class="trusted-time topbar-time" title="Время сервера и NTP Ташкента">
+                        <span class="trusted-time-label">ТАШКЕНТ</span>
+                        <strong class="tashkent-clock" id="tashkent-clock">--:--:--</strong>
+                        <small class="tashkent-date" id="tashkent-date">получение времени...</small>
+                    </div>
+                </div>
+            </header>
+            <main class="workspace"><div class="page-content">@RenderBody()</div></main>
+        </div>
+    </div>
+
+    <div class="ops-bottom-status" aria-label="Состояние системы">
+        <div class="system-load" id="system-load">
+            <button class="system-load-button" type="button" onclick="toggleSystemMetrics(event)" aria-controls="system-metrics-popover" aria-expanded="false" aria-label="Нагрузка сервера" title="Нагрузка сервера">
+                <span class="system-load-icon" aria-hidden="true"><i data-lucide="gauge"></i></span>
+                <span class="system-load-value"><small>CPU</small><strong id="system-cpu-value">—</strong></span>
+                <span class="system-load-divider" aria-hidden="true"></span>
+                <span class="system-load-value"><small>RAM</small><strong id="system-ram-value">—</strong></span>
+            </button>
+            <section class="system-metrics-popover" id="system-metrics-popover" hidden aria-label="Показатели нагрузки сервера">
+                <header>
+                    <span><strong>Нагрузка сервера</strong><small id="system-metrics-updated">Получение данных...</small></span>
+                    <i data-lucide="server-cog"></i>
+                </header>
+                <div class="system-metric-row">
+                    <div><span><i data-lucide="cpu"></i>Процессор</span><strong id="system-detail-cpu">—</strong></div>
+                    <span class="system-metric-meter"><i id="system-cpu-meter"></i></span>
+                </div>
+                <div class="system-metric-row">
+                    <div><span><i data-lucide="memory-stick"></i>Оперативная память</span><strong id="system-detail-ram">—</strong></div>
+                    <span class="system-metric-caption" id="system-ram-caption">—</span>
+                    <span class="system-metric-meter"><i id="system-ram-meter"></i></span>
+                </div>
+                <dl class="system-metric-details">
+                    <div><dt>Приложение</dt><dd id="system-process-load">—</dd></div>
+                    <div><dt>Память приложения</dt><dd id="system-process-memory">—</dd></div>
+                    <div><dt>Проверки камер</dt><dd id="system-active-checks">—</dd></div>
+                    <div><dt>Процессор системы</dt><dd id="system-core-count">—</dd></div>
+                    <div><dt>Потоки приложения</dt><dd id="system-thread-count">—</dd></div>
+                    <div><dt>Время работы</dt><dd id="system-uptime">—</dd></div>
+                </dl>
+                <p class="system-metrics-error" id="system-metrics-error" hidden>Данные временно недоступны</p>
+            </section>
+        </div>
+        @if (canViewAlerts)
+        {
+            <div class="workspace-planner" id="workspace-planner" data-can-edit="@canWorkAlerts.ToString().ToLowerInvariant()" data-can-share="@isAdministrator.ToString().ToLowerInvariant()">
+                <button class="icon-button planner-button" type="button" onclick="toggleWorkspacePlanner(event)" aria-controls="workspace-planner-popover" aria-expanded="false" aria-label="Заметки и календарь" title="Заметки и календарь">
+                    <i data-lucide="calendar-days"></i>
+                    <b id="planner-note-count" hidden>0</b>
+                </button>
+                <section class="workspace-planner-popover" id="workspace-planner-popover" hidden aria-label="Заметки и календарь">
+                    <header>
+                        <div><strong>Заметки и календарь</strong><small id="workspace-planner-summary">Ваши заметки</small></div>
+                        <button class="icon-button" type="button" onclick="closeWorkspacePlanner()" aria-label="Закрыть календарь" title="Закрыть"><i data-lucide="x"></i></button>
+                    </header>
+                    <nav class="workspace-calendar-toolbar" aria-label="Навигация по календарю">
+                        <button class="icon-button" type="button" onclick="changeWorkspaceCalendarMonth(-1)" aria-label="Предыдущий месяц" title="Предыдущий месяц"><i data-lucide="chevron-left"></i></button>
+                        <strong id="workspace-calendar-month">Месяц</strong>
+                        <button class="icon-button" type="button" onclick="changeWorkspaceCalendarMonth(1)" aria-label="Следующий месяц" title="Следующий месяц"><i data-lucide="chevron-right"></i></button>
+                        <button class="btn btn-secondary" type="button" onclick="selectWorkspaceCalendarToday()">Сегодня</button>
+                    </nav>
+                    <div class="workspace-planner-body">
+                        <section class="workspace-calendar" aria-label="Календарь заметок">
+                            <div class="workspace-calendar-weekdays" aria-hidden="true"><span>Пн</span><span>Вт</span><span>Ср</span><span>Чт</span><span>Пт</span><span>Сб</span><span>Вс</span></div>
+                            <div class="workspace-calendar-grid" id="workspace-calendar-grid"></div>
+                        </section>
+                        <section class="workspace-agenda" aria-label="Заметки выбранного дня">
+                            <header><div><strong id="workspace-agenda-date">Сегодня</strong><small id="workspace-agenda-count">Нет заметок</small></div>
+                                @if (canWorkAlerts)
+                                {
+                                    <button class="btn btn-secondary" type="button" onclick="openWorkspaceNoteEditor()"><i data-lucide="plus"></i> Добавить</button>
+                                }
+                            </header>
+                            <div class="workspace-note-list" id="workspace-note-list"><span class="workspace-note-empty">Загрузка...</span></div>
+                            @if (canWorkAlerts)
+                            {
+                                <form class="workspace-note-form" id="workspace-note-form" hidden onsubmit="saveWorkspaceNote(event)">
+                                    <input id="workspace-note-id" type="hidden">
+                                    <label><strong>Название:</strong><input class="form-input" id="workspace-note-title" maxlength="256" required></label>
+                                    @if (isAdministrator)
+                                    {
+                                        <label class="workspace-note-audience"><strong>Кому:</strong><select class="form-select" id="workspace-note-audience"><option value="private">Только мне</option><option value="all">Всем аккаунтам</option></select></label>
+                                    }
+                                    <div>
+                                        <label><strong>Время:</strong><input class="form-input" id="workspace-note-time" type="time" required value="09:00"></label>
+                                        <label><strong>Цвет:</strong><select class="form-select" id="workspace-note-tone"><option value="info">Обычная</option><option value="warning">Важная</option><option value="danger">Срочная</option><option value="success">Информационная</option></select></label>
+                                    </div>
+                                    <label><strong>Заметка:</strong><textarea class="form-input" id="workspace-note-body" rows="3" maxlength="4000"></textarea></label>
+                                    <footer><button class="btn btn-ghost" type="button" onclick="closeWorkspaceNoteEditor()">Отмена</button><button class="btn btn-primary" type="submit"><i data-lucide="save"></i> Сохранить</button></footer>
+                                </form>
+                            }
+                        </section>
+                    </div>
+                </section>
+            </div>
+            <div class="account-notifications" id="account-notifications">
+                <button class="icon-button notification-button" type="button" onclick="toggleAccountNotifications(event)" aria-controls="notification-popover" aria-expanded="false" aria-label="Уведомления" title="Уведомления">
+                    <i data-lucide="bell"></i>
+                    <b id="notification-count" class="notification-new-badge" title="Новые уведомления" hidden>0</b>
+                    <b id="notification-read-badge" class="notification-read-badge" title="Просмотренные, но не закрытые" hidden>0</b>
+                </button>
+                <section class="notification-popover" id="notification-popover" hidden aria-label="Уведомления аккаунта">
+                    <header><div><strong>Уведомления</strong><small id="notification-summary">Нет новых событий</small></div><a href="/Settings/Notifications" title="Настроить уведомления"><i data-lucide="settings-2"></i></a></header>
+                    <nav class="notification-tabs" aria-label="Разделы уведомлений">
+                        <button class="active" type="button" data-notification-tab="new" onclick="switchAccountNotificationTab('new', event)">Новые <b id="notification-new-count">0</b></button>
+                        <button type="button" data-notification-tab="read" onclick="switchAccountNotificationTab('read', event)">Просмотренные <b id="notification-read-count">0</b></button>
+                    </nav>
+                    <div class="notification-list" id="notification-list"><span class="notification-empty">Загрузка...</span></div>
+                </section>
+            </div>
+        }
+    </div>
+
+    <div class="toast-container" id="toast-container" aria-live="polite"></div>
+
+    <div id="modal-container" class="modal-overlay" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+            <div class="modal-header">
+                <div class="modal-header-copy">
+                    <div class="modal-context" id="modal-context"><span class="eyebrow">Действие</span></div>
+                    <div class="modal-title-row">
+                        <h3 id="modal-title"></h3>
+                        <div class="modal-title-badges" id="modal-title-badges" hidden></div>
+                    </div>
+                    <div class="modal-subcontext" id="modal-subcontext" hidden></div>
+                </div>
+                <div class="modal-header-side">
+                    <div class="modal-header-actions">
+                        <span class="modal-alert-serial" id="modal-alert-serial" title="Серийный номер ошибки" hidden></span>
+                        <button class="icon-button modal-close" type="button" onclick="closeModal()" aria-label="Закрыть"><i data-lucide="x"></i></button>
+                    </div>
+                    <div class="modal-header-severity" id="modal-header-severity" hidden></div>
+                </div>
+            </div>
+            <div class="modal-body" id="modal-body"></div>
+            <div class="modal-footer" id="modal-footer"></div>
+        </div>
+    </div>
+
+    <div id="image-viewer" class="image-viewer" hidden onclick="if(event.target===this)closeImageViewer()">
+        <button class="icon-button image-viewer-close" type="button" onclick="closeImageViewer()" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        <img id="image-viewer-img" alt="Увеличенный кадр">
+        <div class="image-viewer-caption" id="image-viewer-caption">Кадр ONVIF</div>
+    </div>
+
+    <script type="application/json" id="camera-error-messages">@Html.Raw(System.Text.Json.JsonSerializer.Serialize(CameraErrorMessages.GetTranslations()))</script>
+    <script src="~/js/vendor/lucide.min.js" asp-append-version="true"></script>
+    <script src="~/js/theme.js" asp-append-version="true"></script>
+    <script src="~/js/app.js" asp-append-version="true"></script>
+    <script src="~/js/realtime.js" asp-append-version="true"></script>
+    @RenderSection("Scripts", required: false)
+</body>
+</html>

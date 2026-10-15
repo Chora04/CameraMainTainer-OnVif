@@ -1,0 +1,6 @@
+@model CameraMaintainer.Web.Models.CameraHistoryFolder
+<dl class="history-folder-stats">
+    <div class="technical"><dt><i data-lucide="cpu"></i> Технические</dt><dd>@Model.Technical</dd></div>
+    <div class="physical"><dt><i data-lucide="wrench"></i> Физические</dt><dd>@Model.Physical</dd></div>
+    <div class="duration" title="Среднее по закрытым карточкам: от начала до подтверждённого восстановления, иначе до закрытия. Записи без корректных дат не учитываются."><dt><i data-lucide="clock-3"></i> Среднее устранение</dt><dd>@Model.AverageRepairText</dd></div>
+</dl>

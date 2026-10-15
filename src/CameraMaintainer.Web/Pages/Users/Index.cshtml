@@ -1,0 +1,373 @@
+@page "/Users"
+@attribute [Microsoft.AspNetCore.Authorization.Authorize(Policy = CameraMaintainer.Web.Security.AccessPolicies.ManageUsers)]
+@{
+    ViewData["Title"] = "Доступы";
+}
+
+<div class="page-header">
+    <div>
+        <span class="eyebrow">Администрирование</span>
+        <h1>Доступы</h1>
+        <p>Аккаунты, роли и видимость разделов системы.</p>
+    </div>
+    <button class="btn btn-primary" type="button" onclick="openUserEditor()">
+        <i data-lucide="user-plus"></i> Добавить аккаунт
+    </button>
+</div>
+
+<section class="user-grid">
+    <div class="panel">
+        <div class="panel-header">
+            <div><h2>Пользователи</h2><p>Изменения применяются сразу после сохранения.</p></div>
+            <button class="btn btn-sm" type="button" onclick="loadUsers()"><i data-lucide="refresh-cw"></i> Обновить</button>
+        </div>
+        <div class="table-scroll">
+            <table class="data-table">
+                <thead><tr><th>Пользователь</th><th>Роль</th><th>Разделы</th><th>Проверки</th><th>Состояние</th><th></th></tr></thead>
+                <tbody id="users-table"><tr><td colspan="6" class="text-muted">Загрузка...</td></tr></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header"><div><h2>Роли</h2><p>Готовые наборы прав, которые можно уточнить вручную.</p></div></div>
+        <div class="panel-body">
+            <ul class="permission-list role-reference-list">
+                <li><label><strong>Наблюдатель</strong><span class="text-muted">обзор и просмотр камер</span></label></li>
+                <li><label><strong>Оператор</strong><span class="text-muted">работа с проверками и ошибками</span></label></li>
+                <li><label><strong>Техник</strong><span class="text-muted">настройка и обслуживание камер</span></label></li>
+                <li><label><strong>Администратор</strong><span class="text-muted">полный контроль и управление аккаунтами</span></label></li>
+            </ul>
+        </div>
+    </div>
+</section>
+
+@section Scripts {
+<script>
+    let users = [];
+    let alertBoardColumns = [];
+    let editingUserId = null;
+
+    const roleNames = {
+        Viewer: 'Наблюдатель',
+        Operator: 'Оператор',
+        Technician: 'Техник',
+        Admin: 'Администратор'
+    };
+
+    const sectionFields = [
+        'perm-view',
+        'nav-alerts',
+        'nav-history',
+        'nav-maintenance',
+        'perm-users'
+    ];
+
+    document.addEventListener('DOMContentLoaded', loadUsers);
+    document.addEventListener('camera-maintainer:data-refresh', event => {
+        if (event.detail.topics.includes('users'))
+            event.detail.waitUntil(loadUsers());
+    });
+
+    async function loadUsers() {
+        try {
+            const result = await Promise.all([
+                apiFetch('/api/accounts'),
+                apiFetch('/api/alert-board/columns')
+            ]);
+            users = result[0];
+            alertBoardColumns = result[1];
+            renderUsers();
+        } catch (error) {
+            showToast(error.message, 'error');
+        }
+    }
+
+    function visibleSectionCount(user) {
+        return [
+            user.canViewCameras,
+            user.canViewAlerts,
+            user.canViewAlertHistory,
+            user.canViewMaintenance,
+            user.canManageUsers
+        ].filter(Boolean).length;
+    }
+
+    function renderUsers() {
+        const body = document.getElementById('users-table');
+        if (!users.length) {
+            body.innerHTML = '<tr><td colspan="6" class="text-muted">Пользователей нет</td></tr>';
+            return;
+        }
+
+        body.innerHTML = users.map(user => `
+            <tr>
+                <td><strong>${escapeHtml(user.displayName || user.username)}</strong><small class="text-muted user-login">${escapeHtml(user.username)}</small></td>
+                <td><span class="role-chip role-${escapeHtml((user.role || 'Viewer').toLowerCase())}">${escapeHtml(roleNames[user.role] || 'Наблюдатель')}</span></td>
+                <td><strong>${visibleSectionCount(user)} из 5</strong><small class="text-muted user-login">видимых разделов</small></td>
+                <td>${user.canRunChecks ? 'Разрешены' : 'Только просмотр'}</td>
+                <td><span class="user-status"><i class="status-dot ${user.isActive ? 'online' : 'offline'}"></i>${user.isActive ? 'Активен' : 'Заблокирован'}</span></td>
+                <td><div class="table-actions">
+                    <button class="btn btn-sm" type="button" onclick="openUserEditor(${user.id})"><i data-lucide="pencil"></i> Изменить</button>
+                    ${user.username.toLowerCase() === 'admin' ? '' : `<button class="btn btn-sm btn-danger" type="button" onclick="removeUser(${user.id})"><i data-lucide="trash-2"></i> Удалить</button>`}
+                </div></td>
+            </tr>`).join('');
+        renderIcons();
+    }
+
+    function navigationToggle(id, icon, title, description) {
+        return `
+            <label class="settings-toggle account-permission-toggle">
+                <input id="${id}" type="checkbox">
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="account-permission-icon"><i data-lucide="${icon}"></i></span>
+                <span><strong>${title}</strong><small>${description}</small></span>
+            </label>`;
+    }
+
+    function renderBoardColumnAccess() {
+        if (!alertBoardColumns.length)
+            return '<p class="text-muted">Этапы очереди не настроены.</p>';
+
+        return '<div class="account-stage-access-grid">' + alertBoardColumns.map(function (column, index) {
+            const roles = Array.isArray(column.visibleToRoles) ? column.visibleToRoles.join(',') : '';
+            return '<label class="account-stage-access">' +
+                '<input id="user-stage-' + index + '" type="checkbox" data-stage-key="' + escapeHtml(column.key) + '" data-stage-roles="' + escapeHtml(roles) + '">' +
+                '<span class="account-stage-access-mark" style="--stage-access-color:' + escapeHtml(column.color) + '"></span>' +
+                '<span><strong>' + escapeHtml(column.title) + '</strong><small>' + escapeHtml(column.subtitle || 'Этап очереди ошибок') + '</small></span>' +
+            '</label>';
+        }).join('') + '</div>' +
+        '<p class="form-help account-stage-access-help" id="stage-access-help">Доступ аккаунта дополнительно ограничивается выбранной ролью.</p>';
+    }
+
+    function openUserEditor(id) {
+        editingUserId = id || null;
+        const user = users.find(item => item.id === editingUserId);
+
+        const body = `
+            <div class="account-editor">
+                <section class="settings-section">
+                    <header class="settings-section-header"><span class="settings-section-index">01</span><h4>Аккаунт</h4></header>
+                    <div class="settings-grid">
+                        <div class="form-group"><label class="form-label" for="user-username">Имя пользователя</label><input id="user-username" class="form-input" value="${escapeHtml(user?.username || '')}" ${editingUserId ? 'readonly' : ''}></div>
+                        <div class="form-group"><label class="form-label" for="user-display">Отображаемое имя</label><input id="user-display" class="form-input" value="${escapeHtml(user?.displayName || '')}"></div>
+                        <div class="form-group"><label class="form-label" for="user-role">Роль</label><select id="user-role" class="form-select"><option value="Viewer">Наблюдатель</option><option value="Operator">Оператор</option><option value="Technician">Техник</option><option value="Admin">Администратор</option></select></div>
+                        <div class="form-group"><label class="form-label" for="user-password">Пароль ${editingUserId ? '(не заполняйте, чтобы не менять)' : ''}</label><input id="user-password" class="form-input" type="password" minlength="8" autocomplete="new-password"></div>
+                    </div>
+                </section>
+
+                <section class="settings-section">
+                    <header class="settings-section-header"><span class="settings-section-index">02</span><h4>Доступ к разделам</h4><span class="settings-state">Отображение для аккаунта</span></header>
+                    <div class="account-permission-grid">
+                        ${navigationToggle('perm-view', 'cctv', 'Камеры', 'Сводка состояния, реестр, кадры и показатели')}
+                        ${navigationToggle('nav-alerts', 'triangle-alert', 'Ошибки', 'Активные физические и технические ошибки')}
+                        ${navigationToggle('nav-history', 'history', 'История', 'Закрытые ошибки и выполненные работы')}
+                        ${navigationToggle('nav-maintenance', 'wrench', 'Обслуживание камер', 'Вкладка очереди и технических операций внутри раздела «Камеры»')}
+                        ${navigationToggle('perm-users', 'users', 'Доступы', 'Управление аккаунтами, только для администратора')}
+                    </div>
+                </section>
+
+                <section class="settings-section">
+                    <header class="settings-section-header"><span class="settings-section-index">03</span><h4>Этапы очереди ошибок</h4><span class="settings-state">Индивидуальный доступ</span></header>
+                    ${renderBoardColumnAccess()}
+                </section>
+
+                <section class="settings-section">
+                    <header class="settings-section-header"><span class="settings-section-index">04</span><h4>Рабочие действия</h4></header>
+                    <div class="account-action-grid">
+                        <label class="settings-toggle account-action-toggle"><input id="perm-check" type="checkbox"><span class="toggle-track"></span><span><strong>Запускать проверки</strong><small>Ручная проверка камер и работа с ошибками</small></span></label>
+                        <label class="settings-toggle account-action-toggle"><input id="perm-camera" type="checkbox"><span class="toggle-track"></span><span><strong>Управлять камерами</strong><small>Добавление, настройка и удаление устройств</small></span></label>
+                        <label class="settings-toggle account-action-toggle"><input id="perm-active" type="checkbox"><span class="toggle-track"></span><span><strong>Аккаунт активен</strong><small>Разрешить вход в систему</small></span></label>
+                    </div>
+                </section>
+                <div id="user-editor-error" class="auth-error"></div>
+            </div>`;
+
+        showModal(
+            editingUserId ? 'Изменить аккаунт' : 'Новый аккаунт',
+            body,
+            '<button class="btn btn-secondary" type="button" onclick="closeModal()">Отмена</button><button class="btn btn-primary" type="button" onclick="saveUser()"><i data-lucide="save"></i> Сохранить</button>');
+
+        const roleSelect = document.getElementById('user-role');
+        roleSelect.value = user?.role || 'Viewer';
+        roleSelect.addEventListener('change', () => {
+            applyRoleDefaults(roleSelect.value);
+            syncBoardColumnAccess(true);
+        });
+        document.getElementById('nav-alerts').addEventListener('change', () => {
+            syncNavigationDependencies();
+            syncBoardColumnAccess(false);
+        });
+        document.getElementById('perm-view').addEventListener('change', syncNavigationDependencies);
+
+        if (user) {
+            setChecked('perm-view', user.canViewCameras);
+            setChecked('nav-alerts', user.canViewAlerts);
+            setChecked('nav-history', user.canViewAlertHistory);
+            setChecked('nav-maintenance', user.canViewMaintenance);
+            setChecked('perm-check', user.canRunChecks);
+            setChecked('perm-camera', user.canManageCameras);
+            setChecked('perm-users', user.canManageUsers);
+            setChecked('perm-active', user.isActive);
+        } else {
+            applyRoleDefaults('Viewer');
+            setChecked('perm-active', true);
+        }
+
+        applyBoardColumnSelection(user);
+        syncRoleControls();
+        if (user?.username?.toLowerCase() === 'admin') protectBuiltInAdmin();
+        renderIcons();
+    }
+
+    function setChecked(id, value) {
+        const input = document.getElementById(id);
+        if (input) input.checked = Boolean(value);
+    }
+
+    function applyRoleDefaults(role) {
+        const profiles = {
+            Viewer:     { dashboard: true, cameras: true, alerts: false, history: false, maintenance: false, checks: false, manage: false, users: false },
+            Operator:   { dashboard: true, cameras: true, alerts: true,  history: true,  maintenance: false, checks: true,  manage: false, users: false },
+            Technician: { dashboard: true, cameras: true, alerts: true,  history: true,  maintenance: true,  checks: true,  manage: true,  users: false },
+            Admin:      { dashboard: true, cameras: true, alerts: true,  history: true,  maintenance: true,  checks: true,  manage: true,  users: true }
+        };
+        const profile = profiles[role] || profiles.Viewer;
+        setChecked('perm-view', profile.cameras);
+        setChecked('nav-alerts', profile.alerts);
+        setChecked('nav-history', profile.history);
+        setChecked('nav-maintenance', profile.maintenance);
+        setChecked('perm-check', profile.checks);
+        setChecked('perm-camera', profile.manage);
+        setChecked('perm-users', profile.users);
+        syncRoleControls();
+    }
+
+    function syncRoleControls() {
+        const role = document.getElementById('user-role')?.value;
+        const accessToggle = document.getElementById('perm-users');
+        if (accessToggle) {
+            accessToggle.disabled = role !== 'Admin';
+            if (role !== 'Admin') accessToggle.checked = false;
+        }
+        syncNavigationDependencies();
+        syncBoardColumnAccess(false);
+    }
+
+    function applyBoardColumnSelection(user) {
+        const selected = Array.isArray(user?.alertBoardColumnKeys)
+            ? new Set(user.alertBoardColumnKeys)
+            : null;
+        const role = document.getElementById('user-role')?.value || 'Viewer';
+
+        document.querySelectorAll('[data-stage-key]').forEach(input => {
+            const allowedByRole = role === 'Admin' || (input.dataset.stageRoles || '').split(',').includes(role);
+            input.checked = role === 'Admin' || (allowedByRole && (selected == null || selected.has(input.dataset.stageKey)));
+        });
+    }
+
+    function syncBoardColumnAccess(resetSelection) {
+        const role = document.getElementById('user-role')?.value || 'Viewer';
+        const alertsEnabled = document.getElementById('nav-alerts')?.checked !== false;
+        document.querySelectorAll('[data-stage-key]').forEach(input => {
+            const allowedByRole = role === 'Admin' || (input.dataset.stageRoles || '').split(',').includes(role);
+            if (resetSelection) input.checked = allowedByRole;
+            if (!allowedByRole) input.checked = false;
+            if (role === 'Admin') input.checked = true;
+            input.disabled = role === 'Admin' || !allowedByRole || !alertsEnabled;
+            input.closest('.account-stage-access')?.classList.toggle('is-role-blocked', !allowedByRole);
+        });
+
+        const help = document.getElementById('stage-access-help');
+        if (help) {
+            help.textContent = role === 'Admin'
+                ? 'Администратору всегда доступны все этапы.'
+                : 'Можно выбрать только этапы, разрешенные для роли «' + (roleNames[role] || role) + '».';
+        }
+    }
+
+    function syncNavigationDependencies() {
+        const cameras = document.getElementById('perm-view');
+        const maintenance = document.getElementById('nav-maintenance');
+        const manageCameras = document.getElementById('perm-camera');
+        const alerts = document.getElementById('nav-alerts');
+        const history = document.getElementById('nav-history');
+        const checks = document.getElementById('perm-check');
+
+        if (alerts && history) {
+            history.disabled = !alerts.checked;
+            if (!alerts.checked) history.checked = false;
+        }
+
+        if (cameras && maintenance && manageCameras) {
+            maintenance.disabled = !cameras.checked;
+            manageCameras.disabled = !cameras.checked;
+            if (!cameras.checked) {
+                maintenance.checked = false;
+                manageCameras.checked = false;
+            }
+        }
+
+        if (checks && cameras && alerts) {
+            const hasWorkSection = cameras.checked || alerts.checked;
+            checks.disabled = !hasWorkSection;
+            if (!hasWorkSection) checks.checked = false;
+        }
+    }
+
+    function protectBuiltInAdmin() {
+        const role = document.getElementById('user-role');
+        if (role) role.disabled = true;
+        [...sectionFields, 'perm-check', 'perm-camera', 'perm-active'].forEach(id => {
+            const input = document.getElementById(id);
+            if (input) input.disabled = true;
+        });
+        document.querySelectorAll('[data-stage-key]').forEach(input => input.disabled = true);
+    }
+
+    async function saveUser() {
+        const payload = {
+            username: document.getElementById('user-username').value.trim(),
+            displayName: document.getElementById('user-display').value.trim(),
+            password: document.getElementById('user-password').value || null,
+            role: document.getElementById('user-role').value,
+            canViewDashboard: document.getElementById('perm-view').checked,
+            canViewCameras: document.getElementById('perm-view').checked,
+            canViewAlerts: document.getElementById('nav-alerts').checked,
+            canViewAlertHistory: document.getElementById('nav-history').checked,
+            canViewMaintenance: document.getElementById('nav-maintenance').checked,
+            canRunChecks: document.getElementById('perm-check').checked,
+            canManageCameras: document.getElementById('perm-camera').checked,
+            canManageUsers: document.getElementById('perm-users').checked,
+            alertBoardColumnKeys: Array.from(document.querySelectorAll('[data-stage-key]:checked'))
+                .map(input => input.dataset.stageKey),
+            isActive: document.getElementById('perm-active').checked
+        };
+
+        try {
+            await apiFetch(editingUserId ? '/api/accounts/' + editingUserId : '/api/accounts', {
+                method: editingUserId ? 'PUT' : 'POST',
+                body: payload
+            });
+            closeModal();
+            showToast('Аккаунт и видимость разделов сохранены', 'success');
+            await loadUsers();
+        } catch (error) {
+            const target = document.getElementById('user-editor-error');
+            if (target) target.textContent = error.message;
+            else showToast(error.message, 'error');
+        }
+    }
+
+    async function removeUser(id) {
+        if (!confirm('Удалить аккаунт?')) return;
+        try {
+            await apiFetch('/api/accounts/' + id, { method: 'DELETE' });
+            showToast('Аккаунт удалён', 'success');
+            await loadUsers();
+        } catch (error) {
+            showToast(error.message, 'error');
+        }
+    }
+</script>
+}
